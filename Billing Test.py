@@ -10,7 +10,7 @@ import os
 
 # --- DATABASE SETUP ---
 # Replace with your MongoDB URI if using Atlas
-client = MongoClient("mongodb+srv://mykeltiu_db_user:Gu8suUJVihviPrjq@testing.kwm3vtx.mongodb.net/")
+client = MongoClient(st.secrets["MONGO_URI"])
 db = client["spreadsheet_app"]
 collection = db["sheets"]
 
