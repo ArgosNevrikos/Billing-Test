@@ -1,3 +1,7 @@
+streamlit
+pandas
 pymongo
 matplotlib
 fpdf
+numpy
+openpyxl
