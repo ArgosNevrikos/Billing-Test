@@ -9,8 +9,12 @@ import tempfile
 import os
 
 # --- DATABASE SETUP ---
-# Replace with your MongoDB URI if using Atlas
-client = MongoClient(st.secrets["MONGO_URI"])
+@st.cache_resource
+def init_connection():
+    # Cache the database connection so it doesn't reconnect on every rerun
+    return MongoClient(st.secrets["MONGO_URI"])
+
+client = init_connection()
 db = client["spreadsheet_app"]
 collection = db["sheets"]
 
@@ -21,13 +25,40 @@ st.markdown("Create, modify, and delete Excel-style sheets stored in MongoDB.")
 
 # --- FUNCTIONS ---
 def fix_arrow_types(df):
-    """Converts mixed 'object' columns to strings to prevent PyArrow crashes."""
-    for col in df.select_dtypes(include=['object', 'string']).columns:
-        df[col] = df[col].astype(str)
+    """Converts mixed 'object' columns to strings using vectorized operations for speed."""
+    cols = df.select_dtypes(include=['object', 'string']).columns
+    if not cols.empty:
+        df[cols] = df[cols].astype(str)
     return df
 
+@st.cache_data(show_spinner=False)
+def load_sheet_names():
+    """Fetches sheet names and caches them to prevent constant DB pings."""
+    return [doc["sheet_name"] for doc in collection.find({}, {"sheet_name": 1})]
+
+@st.cache_data(show_spinner="Loading data from database...")
+def get_sheet_data(name):
+    """Fetches sheet data from MongoDB and caches the resulting dataframe."""
+    doc = collection.find_one({"sheet_name": name})
+    if not doc:
+        return pd.DataFrame()
+    
+    df = pd.DataFrame(doc["data"])
+    return fix_arrow_types(df)
+
+def save_to_mongo(name, df):
+    data = df.to_dict(orient="records")
+    collection.update_one(
+        {"sheet_name": name},
+        {"$set": {"data": data}},
+        upsert=True
+    )
+    # Clear cache so the app fetches the updated data on the next rerun
+    st.cache_data.clear()
+    st.success(f"Sheet '{name}' saved successfully!")
+
 def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie_label_col, pie_val_col, summary_df):
-    """Generates a PDF document with custom styled Bar and Pie charts matching the reference images."""
+    """Generates a PDF document with custom styled Bar and Pie charts."""
     pdf = FPDF()
     pdf.add_page()
     
@@ -36,23 +67,19 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
     pdf.cell(190, 10, f"Analytics Report: {sheet_name}", ln=True, align='C')
     pdf.ln(5)
     
-    # --- EDITABLE SUMMARY METRICS (Printed directly to PDF) ---
+    # --- EDITABLE SUMMARY METRICS ---
     pdf.set_font("Arial", 'B', 12)
     pdf.cell(190, 10, "Summary Totals:", ln=True)
     pdf.set_font("Arial", '', 11)
     
-    # Loop through the custom dataframe to print the exact totals
     for index, row in summary_df.iterrows():
-        # Skip rows the user checked for deletion but hasn't fully removed yet
         if row.get('Select for Deletion', False):
             continue
             
         m_name = str(row['Metric Name'])
         m_val = pd.to_numeric(row['Value'], errors='coerce')
-        if pd.isna(m_val):
-            m_val = 0.0
+        m_val = 0.0 if pd.isna(m_val) else m_val
             
-        # Check the individual row's currency toggle
         show_curr = row.get("Show ₱", True)
         curr_prefix = "PHP " if show_curr else ""
         
@@ -60,14 +87,12 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
         
     pdf.ln(5)
     
-    # --- CHART 1: EXPECTED VS ACTUAL (Grouped Bar Chart) ---
+    # --- CHART 1: EXPECTED VS ACTUAL ---
     if label_col in df.columns and expected_col in df.columns and actual_col in df.columns:
         fig, ax = plt.subplots(figsize=(10, 5))
         
-        df_bar = df.copy()
-        df_bar[expected_col] = pd.to_numeric(df_bar[expected_col], errors='coerce').fillna(0)
-        df_bar[actual_col] = pd.to_numeric(df_bar[actual_col], errors='coerce').fillna(0)
-        grouped_bar = df_bar.groupby(label_col)[[expected_col, actual_col]].sum().reset_index()
+        # Optimize aggregation
+        grouped_bar = df.groupby(label_col)[[expected_col, actual_col]].sum(numeric_only=True).reset_index()
         
         labels = grouped_bar[label_col].astype(str).tolist()
         expected = grouped_bar[expected_col].tolist()
@@ -76,17 +101,14 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
         x = np.arange(len(labels))
         width = 0.35  
         
-        bars1 = ax.bar(x - width/2, expected, width, label='EXPECTED', color='#4285F4', edgecolor='gray')
-        bars2 = ax.bar(x + width/2, actual, width, label='ACTUAL', color='#EA4335', edgecolor='gray')
+        ax.bar(x - width/2, expected, width, label='EXPECTED', color='#4285F4', edgecolor='gray')
+        ax.bar(x + width/2, actual, width, label='ACTUAL', color='#EA4335', edgecolor='gray')
         
         ax.set_title('EXPECTED VS ACTUAL', loc='left', fontsize=18, fontweight='bold', color='gray')
         ax.set_xticks(x)
         ax.set_xticklabels(labels)
         ax.legend(loc='upper left', frameon=False, ncol=2)
-        
-        # Format chart Y-axis
         ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda val, loc: f"₱{val:,.2f}"))
-            
         ax.grid(axis='y', linestyle='-', alpha=0.7)
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
@@ -94,26 +116,24 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
         with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmpfile_bar:
             plt.savefig(tmpfile_bar.name, format='png', bbox_inches='tight', dpi=150)
             bar_path = tmpfile_bar.name
-        plt.close()
+        plt.close(fig) # Explicitly close to free memory
         
         pdf.image(bar_path, x=10, w=190)
         os.remove(bar_path)
         pdf.ln(5)
 
-    # --- CHART 2: BILLING PROGRESS (Pie Chart) ---
+    # --- CHART 2: BILLING PROGRESS ---
     if pie_label_col in df.columns and pie_val_col in df.columns:
         pie_data = df.groupby(pie_label_col)[pie_val_col].sum().reset_index()
-        
         fig, ax = plt.subplots(figsize=(8, 6))
-        
         colors = ['#4285F4', '#EA4335', '#FBBC05', '#34A853']
-        
         total = pie_data[pie_val_col].sum()
+        
         def absolute_value(val):
             a = np.round(val/100.*total, 0)
             return f"{int(a)} ({val:.1f}%)" if val > 5 else f"{val:.1f}%"
             
-        wedges, texts, autotexts = ax.pie(
+        ax.pie(
             pie_data[pie_val_col], 
             labels=pie_data[pie_label_col], 
             autopct=absolute_value,
@@ -129,34 +149,13 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
         with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmpfile_pie:
             plt.savefig(tmpfile_pie.name, format='png', bbox_inches='tight', dpi=150)
             pie_path = tmpfile_pie.name
-        plt.close()
+        plt.close(fig)
         
         pdf.ln(85) 
         pdf.image(pie_path, x=25, w=160)
         os.remove(pie_path)
 
     return pdf.output(dest='S').encode('latin-1')
-
-def save_to_mongo(name, df):
-    data = df.to_dict(orient="records")
-    collection.update_one(
-        {"sheet_name": name},
-        {"$set": {"data": data}},
-        upsert=True
-    )
-    st.success(f"Sheet '{name}' saved successfully!")
-
-def load_sheet_names():
-    return [doc["sheet_name"] for doc in collection.find({}, {"sheet_name": 1})]
-
-def get_sheet_data(name):
-    # THIS FUNCTION PULLS DIRECTLY FROM THE DATABASE
-    doc = collection.find_one({"sheet_name": name})
-    if not doc:
-        return pd.DataFrame()
-    
-    df = pd.DataFrame(doc["data"])
-    return fix_arrow_types(df)
 
 # --- SIDEBAR: NAVIGATION ---
 menu = st.sidebar.radio("Navigation", ["Create New Sheet", "View & Edit Sheet", "Analytics Dashboard", "Manage Database"])
@@ -170,21 +169,21 @@ if menu == "Analytics Dashboard":
     else:
         selected_sheet = st.selectbox("Select sheet for analysis", sheets)
         
-        # PULL FROM DB: df contains the raw data from MongoDB
-        df = get_sheet_data(selected_sheet) 
+        # PULL FROM DB (Cached)
+        df = get_sheet_data(selected_sheet).copy()
         
-        # --- TYPE CONVERSION ---
+        # --- TYPE CONVERSION (Optimized) ---
+        label_keywords = ['id', 'name', 'category', 'status', 'method', 'region', 'month', 'date']
+        
         for col in df.columns:
-            label_keywords = ['id', 'name', 'category', 'status', 'method', 'region', 'month', 'date']
             if any(key in col.lower() for key in label_keywords):
                 df[col] = df[col].astype(str)
-                continue
-            try:
-                converted_num = pd.to_numeric(df[col], errors='coerce')
-                if not converted_num.isna().all():
-                    df[col] = converted_num
-            except:
-                continue
+            else:
+                # Safely attempt conversion using 'coerce'
+                converted = pd.to_numeric(df[col], errors='coerce')
+                # Only apply the conversion if the column isn't entirely NaN (non-numeric)
+                if not converted.isna().all():
+                    df[col] = converted
         
         numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
         cat_cols = df.select_dtypes(include=['object', 'string', 'category']).columns.tolist()
@@ -209,26 +208,23 @@ if menu == "Analytics Dashboard":
 
             st.divider()
 
-            # --- EDITABLE SUMMARY TOTALS (Sourced from DB) ---
+            # --- EDITABLE SUMMARY TOTALS ---
             st.markdown("### 📊 Editable Summary Totals")
-            st.caption("These totals are calculated directly from your database. You can edit names, toggle the currency symbol per row, or delete/add rows. Edits here will not modify your main database.")
+            st.caption("These totals are calculated directly from your database. You can edit names, toggle the currency symbol per row, or delete/add rows.")
             
-            # --- Initialize or Load Session State for the Summary Table ---
-            # This ensures your custom edits and added rows survive when you click buttons
             if "summary_data" not in st.session_state or st.session_state.get("summary_sheet") != selected_sheet:
                 st.session_state.summary_sheet = selected_sheet
-                db_totals = []
-                for col in numeric_cols:
-                    col_total = pd.to_numeric(df[col], errors='coerce').sum()
-                    db_totals.append({
-                        "Select for Deletion": False,
-                        "Show ₱": True,
-                        "Metric Name": f"Total {col}",
-                        "Value": float(col_total)
-                    })
+                
+                # Vectorized sum computation
+                db_totals = [{
+                    "Select for Deletion": False,
+                    "Show ₱": True,
+                    "Metric Name": f"Total {col}",
+                    "Value": float(df[col].sum(skipna=True))
+                } for col in numeric_cols]
+                
                 st.session_state.summary_data = pd.DataFrame(db_totals)
             
-            # Render the interactive data editor
             edited_summary_df = st.data_editor(
                 st.session_state.summary_data,
                 num_rows="dynamic",
@@ -242,26 +238,22 @@ if menu == "Analytics Dashboard":
                 key="summary_editor_widget"
             )
             
-            # Save edits back to session state so they persist
             st.session_state.summary_data = edited_summary_df
 
-            # --- Row Deletion Logic ---
             col_del, col_reset = st.columns(2)
             rows_to_delete_mask = edited_summary_df["Select for Deletion"] == True
             num_to_delete = rows_to_delete_mask.sum()
             
             with col_del:
                 if st.button(f"🚨 Delete {num_to_delete} Selected Rows", disabled=num_to_delete == 0, use_container_width=True):
-                    # Filter out deleted rows and update session state
                     st.session_state.summary_data = edited_summary_df[~rows_to_delete_mask].reset_index(drop=True)
-                    # Clear the widget's internal memory so it redraws properly
                     if "summary_editor_widget" in st.session_state:
                         del st.session_state["summary_editor_widget"]
                     st.rerun()
                     
             with col_reset:
                 if st.button("🔄 Reset to Original DB Totals", use_container_width=True):
-                    st.session_state.summary_sheet = None # Forces a refresh on next run
+                    st.session_state.summary_sheet = None
                     if "summary_editor_widget" in st.session_state:
                         del st.session_state["summary_editor_widget"]
                     st.rerun()
@@ -273,10 +265,7 @@ if menu == "Analytics Dashboard":
             
             fig1, ax1 = plt.subplots(figsize=(10, 5))
             
-            df_bar = df.copy()
-            df_bar[bar_exp] = pd.to_numeric(df_bar[bar_exp], errors='coerce').fillna(0)
-            df_bar[bar_act] = pd.to_numeric(df_bar[bar_act], errors='coerce').fillna(0)
-            grouped_bar = df_bar.groupby(bar_label)[[bar_exp, bar_act]].sum().reset_index()
+            grouped_bar = df.groupby(bar_label)[[bar_exp, bar_act]].sum(numeric_only=True).reset_index()
             
             labels = grouped_bar[bar_label].astype(str).tolist()
             expected = grouped_bar[bar_exp].tolist()
@@ -291,9 +280,7 @@ if menu == "Analytics Dashboard":
             ax1.set_xticks(x)
             ax1.set_xticklabels(labels)
             ax1.legend(loc='upper left', frameon=False, ncol=2)
-            
             ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda val, loc: f"₱{val:,.2f}"))
-                
             ax1.grid(axis='y', linestyle='-', alpha=0.7)
             ax1.spines['top'].set_visible(False)
             ax1.spines['right'].set_visible(False)
@@ -337,12 +324,8 @@ if menu == "Analytics Dashboard":
                 key="pdf_filename_input"
             )
             
-            if not custom_file_name.lower().endswith(".pdf"):
-                final_file_name = f"{custom_file_name}.pdf"
-            else:
-                final_file_name = custom_file_name
+            final_file_name = custom_file_name if custom_file_name.lower().endswith(".pdf") else f"{custom_file_name}.pdf"
             
-            # This passes the final data table to the PDF builder
             pdf_bytes = generate_pdf_report(df, selected_sheet, bar_label, bar_exp, bar_act, pie_label, pie_val, edited_summary_df)
             
             st.download_button(
@@ -351,11 +334,9 @@ if menu == "Analytics Dashboard":
                 file_name=final_file_name,
                 mime="application/pdf",
                 type="primary",
-                use_container_width=True,
-                key="pdf_export_button_unique"
+                use_container_width=True
             )
 
-# --- (The rest of your creation and edit tabs remain the same below) ---
 elif menu == "Create New Sheet":
     st.header("✨ Create a New Sheet")
     
@@ -366,16 +347,13 @@ elif menu == "Create New Sheet":
     )
     
     new_name = st.text_input("Sheet Name", placeholder="Monthly_Budget_2024")
-    
     st.divider() 
     
-    # --- METHOD 1: UPLOAD FILE ---
     if creation_method == "Upload File":
         uploaded_file = st.file_uploader("Upload an Excel/CSV file to start", type=["xlsx", "csv"])
         
         if uploaded_file:
             df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith('xlsx') else pd.read_csv(uploaded_file)
-
             df = fix_arrow_types(df)
 
             st.write(f"Preview (Showing all {len(df)} rows):")
@@ -387,7 +365,6 @@ elif menu == "Create New Sheet":
                 else:
                     st.error("Please provide a sheet name.")
 
-    # --- METHOD 2: FROM SCRATCH ---
     elif creation_method == "Create from Scratch":
         st.info("Start typing in the cells below. You can click the bottom row to add more rows!")
         
@@ -406,7 +383,6 @@ elif menu == "Create New Sheet":
             else:
                 st.error("Please provide a sheet name.")
 
-# --- COMBINED EDIT & VIEW PAGE ---
 elif menu == "View & Edit Sheet":
     st.header("📝 View & Edit Sheet")
     sheets = load_sheet_names()
@@ -417,28 +393,17 @@ elif menu == "View & Edit Sheet":
         selected_sheet = st.selectbox("Select sheet to edit/view", sheets)
         df = get_sheet_data(selected_sheet)
         
-        # --- NEW: ADVANCED SEARCH & FILTER ---
         st.subheader("🔍 Search & Filter")
-        
         f_col1, f_col2 = st.columns(2)
         
-        # TEXT FILTER
         with f_col1:
             st.markdown("**📝 Text Search**")
             search_term = st.text_input("Search for...", placeholder="Type word or phrase here...")
             filter_col = st.selectbox("Text Search in Column:", ["All Columns"] + list(df.columns))
             
-        # NUMBER FILTER
         with f_col2:
             st.markdown("**🔢 Number Filter**")
-            
-            numeric_cols = []
-            for col in df.columns:
-                try:
-                    pd.to_numeric(df[col].dropna())
-                    numeric_cols.append(col)
-                except (ValueError, TypeError):
-                    continue
+            numeric_cols = [col for col in df.columns if pd.api.types.is_numeric_dtype(pd.to_numeric(df[col], errors='coerce'))]
             
             use_num_filter = st.checkbox("Enable Number Filter", disabled=len(numeric_cols) == 0)
             
@@ -451,22 +416,20 @@ elif menu == "View & Edit Sheet":
                 with n3:
                     num_val = st.number_input("Value:", value=0.0)
 
-        # APPLY FILTERS
+        # Vectorized Filtering Application
         filtered_df = df.copy()
         
-        # 1. Apply Text Search
         if search_term:
             if filter_col == "All Columns":
+                # Vectorized search across all columns
                 mask = filtered_df.astype(str).apply(lambda x: x.str.contains(search_term, case=False, na=False)).any(axis=1)
                 filtered_df = filtered_df[mask]
             else:
                 mask = filtered_df[filter_col].astype(str).str.contains(search_term, case=False, na=False)
                 filtered_df = filtered_df[mask]
                 
-        # 2. Apply Number Filter
         if use_num_filter and numeric_cols:
             temp_col = pd.to_numeric(filtered_df[num_col], errors='coerce')
-            
             if num_op == ">": filtered_df = filtered_df[temp_col > num_val]
             elif num_op == "<": filtered_df = filtered_df[temp_col < num_val]
             elif num_op == ">=": filtered_df = filtered_df[temp_col >= num_val]
@@ -478,14 +441,10 @@ elif menu == "View & Edit Sheet":
             st.caption(f"Showing {len(filtered_df)} out of {len(df)} total rows.")
             
         st.divider()
-
-        # --- DATA EDITOR INSTRUCTIONS ---
         st.info("✏️ **Edit & Add:** Double-click any cell to edit. Add new rows by typing in the bottom row with the '+' icon.")
 
-        # --- INJECT MULTI-DELETE CHECKBOX COLUMN ---
         filtered_df.insert(0, "Select for Deletion", False)
 
-        # --- DATA EDITOR (Shows Filtered Data) ---
         edited_filtered_df = st.data_editor(
             filtered_df, 
             num_rows="dynamic", 
@@ -500,7 +459,6 @@ elif menu == "View & Edit Sheet":
             }
         )
         
-        # --- QUICK DELETE MULTIPLE ROWS (EXPLICIT BUTTON) ---
         st.markdown("### 🗑️ Bulk Delete Rows")
         st.caption("Check the boxes in the '🗑️ Delete?' column above, then click the button below to permanently erase those rows.")
         
@@ -515,7 +473,6 @@ elif menu == "View & Edit Sheet":
 
         st.divider()
         
-        # --- COLUMN MANAGEMENT ---
         with st.expander("🛠️ Add or Rename Columns"):
             c1, c2 = st.columns(2)
             
@@ -545,12 +502,10 @@ elif menu == "View & Edit Sheet":
 
         st.divider()
         
-        # --- SMART MERGE SAVE & EXPORT ---
         col1, col2 = st.columns(2)
         with col1:
             if st.button("💾 Save Cell Changes", type="primary", width="stretch"):
                 updated_master_df = df.copy()
-                
                 clean_edited_df = edited_filtered_df.drop(columns=["Select for Deletion"])
                 clean_filtered_df = filtered_df.drop(columns=["Select for Deletion"])
                 
@@ -574,7 +529,6 @@ elif menu == "View & Edit Sheet":
             
         st.divider()
         
-        # --- INSPECTOR ---
         st.subheader("🔍 Inspect Individual Rows")
         
         if not edited_filtered_df.empty:
@@ -582,12 +536,10 @@ elif menu == "View & Edit Sheet":
             
             with tab1:
                 st.markdown("Use the navigation buttons or number input to inspect individual rows from the table above.")
-                
                 max_row = max(0, len(edited_filtered_df) - 1)
                 
                 if "current_row" not in st.session_state:
                     st.session_state.current_row = 0
-                
                 if st.session_state.current_row > max_row:
                     st.session_state.current_row = max_row
                 
@@ -637,5 +589,6 @@ elif menu == "Manage Database":
         
         if st.button("🚨 Delete Sheet", type="primary", disabled=not confirm_delete):
             collection.delete_one({"sheet_name": sheet_to_delete})
+            st.cache_data.clear() # Clear cache on deletion
             st.success(f"Deleted {sheet_to_delete}")
             st.rerun()
