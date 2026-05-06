@@ -12,7 +12,7 @@ import os
 @st.cache_resource
 def init_connection():
     # Cache the database connection so it doesn't reconnect on every rerun
-    return MongoClient(st.secrets["MONGO_URI"])
+    return MongoClient("mongodb+srv://mykeltiu_db_user:Gu8suUJVihviPrjq@testing.kwm3vtx.mongodb.net/")
 
 client = init_connection()
 db = client["spreadsheet_app"]
@@ -211,11 +211,11 @@ if menu == "Analytics Dashboard":
             # --- EDITABLE SUMMARY TOTALS ---
             st.markdown("### 📊 Editable Summary Totals")
             st.caption("These totals are calculated directly from your database. You can edit names, toggle the currency symbol per row, or delete/add rows.")
-            
+
+            # 1. Initialize data once per sheet selection
             if "summary_data" not in st.session_state or st.session_state.get("summary_sheet") != selected_sheet:
                 st.session_state.summary_sheet = selected_sheet
                 
-                # Vectorized sum computation
                 db_totals = [{
                     "Select for Deletion": False,
                     "Show ₱": True,
@@ -224,11 +224,14 @@ if menu == "Analytics Dashboard":
                 } for col in numeric_cols]
                 
                 st.session_state.summary_data = pd.DataFrame(db_totals)
-            
+
+            # 2. Render the editor using the session_state as the source
+            # DO NOT assign the output back to st.session_state.summary_data here.
+            # This allows the widget to maintain its own "delta" state during multiple clicks.
             edited_summary_df = st.data_editor(
                 st.session_state.summary_data,
                 num_rows="dynamic",
-                use_container_width=True,
+                width='stretch',
                 column_config={
                     "Select for Deletion": st.column_config.CheckboxColumn("🗑️ Delete?", default=False),
                     "Show ₱": st.column_config.CheckboxColumn("Show ₱", default=True),
@@ -237,22 +240,23 @@ if menu == "Analytics Dashboard":
                 },
                 key="summary_editor_widget"
             )
-            
-            st.session_state.summary_data = edited_summary_df
+
+            # 3. Only update the "master" session state when a button is clicked or during export.
+            # This prevents the "refresh loop" on every checkbox click.
 
             col_del, col_reset = st.columns(2)
             rows_to_delete_mask = edited_summary_df["Select for Deletion"] == True
             num_to_delete = rows_to_delete_mask.sum()
             
             with col_del:
-                if st.button(f"🚨 Delete {num_to_delete} Selected Rows", disabled=num_to_delete == 0, use_container_width=True):
+                if st.button(f"🚨 Delete {num_to_delete} Selected Rows", disabled=num_to_delete == 0, width='stretch'):
                     st.session_state.summary_data = edited_summary_df[~rows_to_delete_mask].reset_index(drop=True)
                     if "summary_editor_widget" in st.session_state:
                         del st.session_state["summary_editor_widget"]
                     st.rerun()
                     
             with col_reset:
-                if st.button("🔄 Reset to Original DB Totals", use_container_width=True):
+                if st.button("🔄 Reset to Original DB Totals", width='stretch'):
                     st.session_state.summary_sheet = None
                     if "summary_editor_widget" in st.session_state:
                         del st.session_state["summary_editor_widget"]
@@ -334,7 +338,7 @@ if menu == "Analytics Dashboard":
                 file_name=final_file_name,
                 mime="application/pdf",
                 type="primary",
-                use_container_width=True
+                width='stretch'
             )
 
 elif menu == "Create New Sheet":
