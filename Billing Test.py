@@ -12,7 +12,7 @@ import os
 @st.cache_resource
 def init_connection():
     # Cache the database connection so it doesn't reconnect on every rerun
-    return MongoClient("mongodb+srv://mykeltiu_db_user:Gu8suUJVihviPrjq@testing.kwm3vtx.mongodb.net/")
+    return MongoClient(st.secrets["MONGO_URI"])
 
 client = init_connection()
 db = client["spreadsheet_app"]
@@ -25,7 +25,7 @@ st.markdown("Create, modify, and delete Excel-style sheets stored in MongoDB.")
 
 # --- FUNCTIONS ---
 def fix_arrow_types(df):
-    """Converts mixed 'object' columns to strings using vectorized operations for speed."""
+    # """Converts mixed 'object' columns to strings using vectorized operations for speed."""
     cols = df.select_dtypes(include=['object', 'string']).columns
     if not cols.empty:
         df[cols] = df[cols].astype(str)
@@ -33,12 +33,12 @@ def fix_arrow_types(df):
 
 @st.cache_data(show_spinner=False)
 def load_sheet_names():
-    """Fetches sheet names and caches them to prevent constant DB pings."""
+    #"""Fetches sheet names and caches them to prevent constant DB pings."""
     return [doc["sheet_name"] for doc in collection.find({}, {"sheet_name": 1})]
 
 @st.cache_data(show_spinner="Loading data from database...")
 def get_sheet_data(name):
-    """Fetches sheet data from MongoDB and caches the resulting dataframe."""
+    #"""Fetches sheet data from MongoDB and caches the resulting dataframe."""
     doc = collection.find_one({"sheet_name": name})
     if not doc:
         return pd.DataFrame()
@@ -58,7 +58,7 @@ def save_to_mongo(name, df):
     st.success(f"Sheet '{name}' saved successfully!")
 
 def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie_label_col, pie_val_col, summary_df):
-    """Generates a PDF document with custom styled Bar and Pie charts."""
+    #"""Generates a PDF document with custom styled Bar and Pie charts."""
     pdf = FPDF()
     pdf.add_page()
     
