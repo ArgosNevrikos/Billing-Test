@@ -26,8 +26,7 @@ def fix_arrow_types(df):
         df[col] = df[col].astype(str)
     return df
 
-# UPDATED: Added summary_df parameter to accept the custom table
-def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie_label_col, pie_val_col, summary_df):
+def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie_label_col, pie_val_col, summary_df, show_currency):
     """Generates a PDF document with custom styled Bar and Pie charts matching the reference images."""
     pdf = FPDF()
     pdf.add_page()
@@ -37,18 +36,21 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
     pdf.cell(190, 10, f"Analytics Report: {sheet_name}", ln=True, align='C')
     pdf.ln(5)
     
-    # --- NEW: EDITABLE SUMMARY METRICS ---
+    # --- EDITABLE SUMMARY METRICS (Printed directly to PDF) ---
     pdf.set_font("Arial", 'B', 12)
     pdf.cell(190, 10, "Summary Totals:", ln=True)
     pdf.set_font("Arial", '', 11)
     
-    # Loop through the custom dataframe the user edited
+    # Conditionally set the currency prefix for the PDF
+    curr_prefix = "PHP " if show_currency else ""
+    
+    # Loop through the custom dataframe to print the exact totals
     for index, row in summary_df.iterrows():
         m_name = str(row['Metric Name'])
         m_val = pd.to_numeric(row['Value'], errors='coerce')
         if pd.isna(m_val):
             m_val = 0.0
-        pdf.cell(190, 8, f"- {m_name}: PHP {m_val:,.2f}", ln=True)
+        pdf.cell(190, 8, f"- {m_name}: {curr_prefix}{m_val:,.2f}", ln=True)
         
     pdf.ln(5)
     
@@ -80,8 +82,12 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
         ax.set_xticklabels(labels)
         ax.legend(loc='upper left', frameon=False, ncol=2)
         
-        # Format Y-axis as currency (₱)
-        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, loc: f"₱{x:,.2f}"))
+        # Format Y-axis conditionally
+        if show_currency:
+            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, loc: f"₱{x:,.2f}"))
+        else:
+            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, loc: f"{x:,.2f}"))
+            
         ax.grid(axis='y', linestyle='-', alpha=0.7)
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
@@ -103,16 +109,13 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
         
         fig, ax = plt.subplots(figsize=(8, 6))
         
-        # Colors matching the image (Blue, Red, Yellow, Green)
         colors = ['#4285F4', '#EA4335', '#FBBC05', '#34A853']
         
-        # Custom autopct to show both absolute value and percentage
         total = pie_data[pie_val_col].sum()
         def absolute_value(val):
             a = np.round(val/100.*total, 0)
             return f"{int(a)} ({val:.1f}%)" if val > 5 else f"{val:.1f}%"
             
-        # Plotting pie chart with shadow for 3D effect
         wedges, texts, autotexts = ax.pie(
             pie_data[pie_val_col], 
             labels=pie_data[pie_label_col], 
@@ -126,7 +129,6 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
         ax.set_title('BILLING PROGRESS\n', loc='left', fontsize=18, fontweight='bold', color='gray')
         ax.axis('equal') 
         
-        # Save and embed Pie Chart
         with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmpfile_pie:
             plt.savefig(tmpfile_pie.name, format='png', bbox_inches='tight', dpi=150)
             pie_path = tmpfile_pie.name
@@ -151,6 +153,7 @@ def load_sheet_names():
     return [doc["sheet_name"] for doc in collection.find({}, {"sheet_name": 1})]
 
 def get_sheet_data(name):
+    # THIS FUNCTION PULLS DIRECTLY FROM THE DATABASE
     doc = collection.find_one({"sheet_name": name})
     if not doc:
         return pd.DataFrame()
@@ -169,7 +172,9 @@ if menu == "Analytics Dashboard":
         st.info("No data available. Please create or upload a sheet first.")
     else:
         selected_sheet = st.selectbox("Select sheet for analysis", sheets)
-        df = get_sheet_data(selected_sheet)
+        
+        # PULL FROM DB: df contains the raw data from MongoDB
+        df = get_sheet_data(selected_sheet) 
         
         # --- TYPE CONVERSION ---
         for col in df.columns:
@@ -207,34 +212,34 @@ if menu == "Analytics Dashboard":
 
             st.divider()
 
-            # --- UPDATED: EDITABLE SUMMARY TOTALS ---
-            st.markdown("### 📊 Editable Summary Totals")
-            st.caption("You can edit the names, adjust the calculated values, or add completely new rows. Everything in this table will be printed on your PDF report.")
+            # --- EDITABLE SUMMARY TOTALS (Sourced from DB) ---
+            st.markdown("### 📊 Summary Totals")
             
-            total_exp = pd.to_numeric(df[bar_exp], errors='coerce').sum()
-            total_act = pd.to_numeric(df[bar_act], errors='coerce').sum()
-            total_pie = pd.to_numeric(df[pie_val], errors='coerce').sum()
+            # Toggle for the currency symbol
+            show_currency = st.checkbox("Show Currency Symbol (₱)", value=True)
             
-            # Build the starter data
-            default_summary = [
-                {"Metric Name": f"Total Expected ({bar_exp})", "Value": float(total_exp)},
-                {"Metric Name": f"Total Actual ({bar_act})", "Value": float(total_act)}
-            ]
-            if pie_val not in [bar_exp, bar_act]:
-                default_summary.append({"Metric Name": f"Total {pie_val}", "Value": float(total_pie)})
-            else:
-                default_summary.append({"Metric Name": "Combined Expected & Actual", "Value": float(total_exp + total_act)})
+            st.caption("These totals are calculated directly from your database. You can edit the names or add custom rows. Edits are for the PDF report only and will not modify your database.")
+            
+            # --- NEW: Get all numeric columns from the Database and calculate totals ---
+            db_totals = []
+            for col in numeric_cols:
+                col_total = pd.to_numeric(df[col], errors='coerce').sum()
+                db_totals.append({"Metric Name": f"Total {col}", "Value": float(col_total)})
                 
-            summary_df = pd.DataFrame(default_summary)
+            summary_df = pd.DataFrame(db_totals)
             
-            # Render the interactive data editor
+            # Determine format string based on checkbox
+            val_format = "₱%.2f" if show_currency else "%.2f"
+            col_label = "Value (₱)" if show_currency else "Value"
+            
+            # Render the interactive data editor with the DB totals
             edited_summary_df = st.data_editor(
                 summary_df,
-                num_rows="dynamic", # Allows adding/deleting rows
+                num_rows="dynamic",
                 use_container_width=True,
                 column_config={
                     "Metric Name": st.column_config.TextColumn("Metric Name", required=True),
-                    "Value": st.column_config.NumberColumn("Value (₱)", format="₱%.2f", required=True)
+                    "Value": st.column_config.NumberColumn(col_label, format=val_format, required=True)
                 },
                 key="summary_editor"
             )
@@ -264,7 +269,12 @@ if menu == "Analytics Dashboard":
             ax1.set_xticks(x)
             ax1.set_xticklabels(labels)
             ax1.legend(loc='upper left', frameon=False, ncol=2)
-            ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda val, loc: f"₱{val:,.2f}"))
+            
+            if show_currency:
+                ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda val, loc: f"₱{val:,.2f}"))
+            else:
+                ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda val, loc: f"{val:,.2f}"))
+                
             ax1.grid(axis='y', linestyle='-', alpha=0.7)
             ax1.spines['top'].set_visible(False)
             ax1.spines['right'].set_visible(False)
@@ -313,8 +323,8 @@ if menu == "Analytics Dashboard":
             else:
                 final_file_name = custom_file_name
             
-            # UPDATED: Pass the custom edited_summary_df into the PDF generator
-            pdf_bytes = generate_pdf_report(df, selected_sheet, bar_label, bar_exp, bar_act, pie_label, pie_val, edited_summary_df)
+            # This passes the final data table to the PDF builder
+            pdf_bytes = generate_pdf_report(df, selected_sheet, bar_label, bar_exp, bar_act, pie_label, pie_val, edited_summary_df, show_currency)
             
             st.download_button(
                 label="Download Full Report as PDF",
@@ -326,6 +336,7 @@ if menu == "Analytics Dashboard":
                 key="pdf_export_button_unique"
             )
 
+# --- (The rest of your creation and edit tabs remain the same below) ---
 elif menu == "Create New Sheet":
     st.header("✨ Create a New Sheet")
     
