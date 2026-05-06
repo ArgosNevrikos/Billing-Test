@@ -2,8 +2,8 @@ import streamlit as st
 import pandas as pd
 from pymongo import MongoClient
 from io import BytesIO
-import matplotlib.pyplot as plt # New: For generating static charts
-from fpdf import FPDF           # New: For generating the PDF document
+import matplotlib.pyplot as plt 
+from fpdf import FPDF           
 import numpy as np
 import tempfile
 import os
@@ -22,7 +22,6 @@ st.markdown("Create, modify, and delete Excel-style sheets stored in MongoDB.")
 # --- FUNCTIONS ---
 def fix_arrow_types(df):
     """Converts mixed 'object' columns to strings to prevent PyArrow crashes."""
-    # Add 'string' to the include list to satisfy the new Pandas rules
     for col in df.select_dtypes(include=['object', 'string']).columns:
         df[col] = df[col].astype(str)
     return df
@@ -35,6 +34,25 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
     # --- REPORT HEADER ---
     pdf.set_font("Arial", 'B', 16)
     pdf.cell(190, 10, f"Analytics Report: {sheet_name}", ln=True, align='C')
+    pdf.ln(5)
+    
+    # --- NEW: SUMMARY METRICS ---
+    pdf.set_font("Arial", 'B', 12)
+    pdf.cell(190, 10, "Summary Totals:", ln=True)
+    pdf.set_font("Arial", '', 11)
+    
+    if expected_col in df.columns:
+        tot_exp = pd.to_numeric(df[expected_col], errors='coerce').sum()
+        pdf.cell(190, 8, f"- Total Expected ({expected_col}): PHP {tot_exp:,.2f}", ln=True)
+        
+    if actual_col in df.columns:
+        tot_act = pd.to_numeric(df[actual_col], errors='coerce').sum()
+        pdf.cell(190, 8, f"- Total Actual ({actual_col}): PHP {tot_act:,.2f}", ln=True)
+        
+    if pie_val_col in df.columns and pie_val_col not in [expected_col, actual_col]:
+        tot_pie = pd.to_numeric(df[pie_val_col], errors='coerce').sum()
+        pdf.cell(190, 8, f"- Total {pie_val_col}: PHP {tot_pie:,.2f}", ln=True)
+        
     pdf.ln(5)
     
     # --- CHART 1: EXPECTED VS ACTUAL (Grouped Bar Chart) ---
@@ -142,10 +160,9 @@ def get_sheet_data(name):
         return pd.DataFrame()
     
     df = pd.DataFrame(doc["data"])
-    return fix_arrow_types(df)  # <--- Clean the data before sending it to the app
+    return fix_arrow_types(df)
 
 # --- SIDEBAR: NAVIGATION ---
-# --- ADD "Analytics Dashboard" TO YOUR MENU ---
 menu = st.sidebar.radio("Navigation", ["Create New Sheet", "View & Edit Sheet", "Analytics Dashboard", "Manage Database"])
 
 if menu == "Analytics Dashboard":
@@ -183,17 +200,36 @@ if menu == "Analytics Dashboard":
             
             with c1:
                 st.markdown("**Expected vs Actual Chart**")
-                # Added unique keys to each selectbox
                 bar_label = st.selectbox("X-Axis (e.g., Months)", df.columns, index=0, key="bar_label_select")
                 bar_exp = st.selectbox("Expected Values", numeric_cols, index=0 if len(numeric_cols) > 0 else None, key="bar_exp_select")
                 bar_act = st.selectbox("Actual Values", numeric_cols, index=1 if len(numeric_cols) > 1 else 0, key="bar_act_select")
                 
             with c2:
                 st.markdown("**Billing Progress Chart**")
-                # Added unique keys to each selectbox
                 pie_label = st.selectbox("Status Categories", cat_cols, index=0 if len(cat_cols) > 0 else None, key="pie_label_select")
                 pie_val = st.selectbox("Values", numeric_cols, index=0 if len(numeric_cols) > 0 else None, key="pie_val_select")
 
+            st.divider()
+
+            # --- NEW: SUMMARY TOTALS ---
+            st.markdown("### 📊 Summary Totals")
+            sum_cols = st.columns(3)
+            
+            with sum_cols[0]:
+                total_exp = pd.to_numeric(df[bar_exp], errors='coerce').sum()
+                st.metric(label=f"Total Expected ({bar_exp})", value=f"₱{total_exp:,.2f}")
+                
+            with sum_cols[1]:
+                total_act = pd.to_numeric(df[bar_act], errors='coerce').sum()
+                st.metric(label=f"Total Actual ({bar_act})", value=f"₱{total_act:,.2f}")
+                
+            with sum_cols[2]:
+                if pie_val not in [bar_exp, bar_act]:
+                    total_pie = pd.to_numeric(df[pie_val], errors='coerce').sum()
+                    st.metric(label=f"Total {pie_val}", value=f"₱{total_pie:,.2f}")
+                else:
+                    st.metric(label="Combined Expected & Actual", value=f"₱{(total_exp + total_act):,.2f}")
+            
             st.divider()
 
             # --- CHART 1: EXPECTED VS ACTUAL ---
@@ -201,13 +237,11 @@ if menu == "Analytics Dashboard":
             
             fig1, ax1 = plt.subplots(figsize=(10, 5))
             
-            # Group the data to combine identical x-axis labels
             df_bar = df.copy()
             df_bar[bar_exp] = pd.to_numeric(df_bar[bar_exp], errors='coerce').fillna(0)
             df_bar[bar_act] = pd.to_numeric(df_bar[bar_act], errors='coerce').fillna(0)
             grouped_bar = df_bar.groupby(bar_label)[[bar_exp, bar_act]].sum().reset_index()
             
-            # Extract lists from the grouped data
             labels = grouped_bar[bar_label].astype(str).tolist()
             expected = grouped_bar[bar_exp].tolist()
             actual = grouped_bar[bar_act].tolist()
@@ -259,27 +293,23 @@ if menu == "Analytics Dashboard":
             st.divider()
             st.markdown("### 📥 Export Dashboard")
 
-            # 1. Add a text input for the file name (with a smart default)
             custom_file_name = st.text_input(
                 "Save file as:", 
                 value=f"{selected_sheet}_analytics_report",
                 key="pdf_filename_input"
             )
             
-            # 2. Ensure the filename ends with .pdf so the computer recognizes it
             if not custom_file_name.lower().endswith(".pdf"):
                 final_file_name = f"{custom_file_name}.pdf"
             else:
                 final_file_name = custom_file_name
             
-            # Generate the PDF bytes
             pdf_bytes = generate_pdf_report(df, selected_sheet, bar_label, bar_exp, bar_act, pie_label, pie_val)
             
-            # 3. Pass the custom file name into the download button
             st.download_button(
                 label="Download Full Report as PDF",
                 data=pdf_bytes,
-                file_name=final_file_name,  # <--- Now uses the custom name!
+                file_name=final_file_name,
                 mime="application/pdf",
                 type="primary",
                 use_container_width=True,
@@ -362,7 +392,6 @@ elif menu == "View & Edit Sheet":
         with f_col2:
             st.markdown("**🔢 Number Filter**")
             
-            # Dynamically identify columns that contain numbers
             numeric_cols = []
             for col in df.columns:
                 try:
@@ -414,7 +443,6 @@ elif menu == "View & Edit Sheet":
         st.info("✏️ **Edit & Add:** Double-click any cell to edit. Add new rows by typing in the bottom row with the '+' icon.")
 
         # --- INJECT MULTI-DELETE CHECKBOX COLUMN ---
-        # We add this purely for the UI, we will remove it before saving to the database
         filtered_df.insert(0, "Select for Deletion", False)
 
         # --- DATA EDITOR (Shows Filtered Data) ---
@@ -436,15 +464,11 @@ elif menu == "View & Edit Sheet":
         st.markdown("### 🗑️ Bulk Delete Rows")
         st.caption("Check the boxes in the '🗑️ Delete?' column above, then click the button below to permanently erase those rows.")
         
-        # Determine how many rows the user checked
         rows_to_delete_mask = edited_filtered_df["Select for Deletion"] == True
         num_selected_to_delete = rows_to_delete_mask.sum()
         
         if st.button(f"🚨 Permanently Delete {num_selected_to_delete} Selected Row(s)", type="primary", width="stretch", disabled=num_selected_to_delete == 0):
-            # Get the real index of the checked rows
             real_indices_to_drop = edited_filtered_df[rows_to_delete_mask].index
-            
-            # Drop from master dataframe
             updated_master_df_after_drop = df.drop(index=real_indices_to_drop)
             save_to_mongo(selected_sheet, updated_master_df_after_drop)
             st.rerun()
@@ -487,19 +511,15 @@ elif menu == "View & Edit Sheet":
             if st.button("💾 Save Cell Changes", type="primary", width="stretch"):
                 updated_master_df = df.copy()
                 
-                # Strip the temporary deletion column before merging
                 clean_edited_df = edited_filtered_df.drop(columns=["Select for Deletion"])
                 clean_filtered_df = filtered_df.drop(columns=["Select for Deletion"])
                 
-                # 1. Update existing modified rows
                 updated_master_df.update(clean_edited_df)
                 
-                # 2. Append newly added rows
                 new_rows = clean_edited_df[~clean_edited_df.index.isin(df.index)]
                 if not new_rows.empty:
                     updated_master_df = pd.concat([updated_master_df, new_rows], ignore_index=True)
                     
-                # 3. Drop rows that were deleted from the filtered view (via st.data_editor's internal UI)
                 deleted_indices = clean_filtered_df.index.difference(clean_edited_df.index)
                 updated_master_df = updated_master_df.drop(deleted_indices)
                 
@@ -508,7 +528,6 @@ elif menu == "View & Edit Sheet":
                 
         with col2:
             towrite = BytesIO()
-            # Strip the temporary deletion column before exporting
             export_df = edited_filtered_df.drop(columns=["Select for Deletion"])
             export_df.to_excel(towrite, index=False, engine='openpyxl')
             st.download_button(label="📥 Download View as Excel", data=towrite.getvalue(), file_name=f"{selected_sheet}_export.xlsx", width="stretch")
@@ -553,7 +572,6 @@ elif menu == "View & Edit Sheet":
                     st.markdown("<div style='margin-top: 28px;'></div>", unsafe_allow_html=True)
                     st.button("Next ➡️", on_click=go_next_row, width="stretch", disabled=st.session_state.current_row >= max_row)
                 
-                # Data Inspector (Cleaned of the temporary UI column)
                 st.write(f"**Showing Data for Table Row {st.session_state.current_row}:**")
                 display_row = edited_filtered_df.drop(columns=["Select for Deletion"]).iloc[st.session_state.current_row].to_dict()
                 st.json(display_row)
