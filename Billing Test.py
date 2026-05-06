@@ -26,7 +26,8 @@ def fix_arrow_types(df):
         df[col] = df[col].astype(str)
     return df
 
-def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie_label_col, pie_val_col):
+# UPDATED: Added summary_df parameter to accept the custom table
+def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie_label_col, pie_val_col, summary_df):
     """Generates a PDF document with custom styled Bar and Pie charts matching the reference images."""
     pdf = FPDF()
     pdf.add_page()
@@ -36,22 +37,18 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
     pdf.cell(190, 10, f"Analytics Report: {sheet_name}", ln=True, align='C')
     pdf.ln(5)
     
-    # --- NEW: SUMMARY METRICS ---
+    # --- NEW: EDITABLE SUMMARY METRICS ---
     pdf.set_font("Arial", 'B', 12)
     pdf.cell(190, 10, "Summary Totals:", ln=True)
     pdf.set_font("Arial", '', 11)
     
-    if expected_col in df.columns:
-        tot_exp = pd.to_numeric(df[expected_col], errors='coerce').sum()
-        pdf.cell(190, 8, f"- Total Expected ({expected_col}): PHP {tot_exp:,.2f}", ln=True)
-        
-    if actual_col in df.columns:
-        tot_act = pd.to_numeric(df[actual_col], errors='coerce').sum()
-        pdf.cell(190, 8, f"- Total Actual ({actual_col}): PHP {tot_act:,.2f}", ln=True)
-        
-    if pie_val_col in df.columns and pie_val_col not in [expected_col, actual_col]:
-        tot_pie = pd.to_numeric(df[pie_val_col], errors='coerce').sum()
-        pdf.cell(190, 8, f"- Total {pie_val_col}: PHP {tot_pie:,.2f}", ln=True)
+    # Loop through the custom dataframe the user edited
+    for index, row in summary_df.iterrows():
+        m_name = str(row['Metric Name'])
+        m_val = pd.to_numeric(row['Value'], errors='coerce')
+        if pd.isna(m_val):
+            m_val = 0.0
+        pdf.cell(190, 8, f"- {m_name}: PHP {m_val:,.2f}", ln=True)
         
     pdf.ln(5)
     
@@ -127,7 +124,7 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
         )
         
         ax.set_title('BILLING PROGRESS\n', loc='left', fontsize=18, fontweight='bold', color='gray')
-        ax.axis('equal') # Equal aspect ratio ensures that pie is drawn as a circle.
+        ax.axis('equal') 
         
         # Save and embed Pie Chart
         with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmpfile_pie:
@@ -135,7 +132,6 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
             pie_path = tmpfile_pie.name
         plt.close()
         
-        # Move down slightly so charts don't overlap, then draw
         pdf.ln(85) 
         pdf.image(pie_path, x=25, w=160)
         os.remove(pie_path)
@@ -211,24 +207,37 @@ if menu == "Analytics Dashboard":
 
             st.divider()
 
-            # --- NEW: SUMMARY TOTALS ---
-            st.markdown("### 📊 Summary Totals")
-            sum_cols = st.columns(3)
+            # --- UPDATED: EDITABLE SUMMARY TOTALS ---
+            st.markdown("### 📊 Editable Summary Totals")
+            st.caption("You can edit the names, adjust the calculated values, or add completely new rows. Everything in this table will be printed on your PDF report.")
             
-            with sum_cols[0]:
-                total_exp = pd.to_numeric(df[bar_exp], errors='coerce').sum()
-                st.metric(label=f"Total Expected ({bar_exp})", value=f"₱{total_exp:,.2f}")
+            total_exp = pd.to_numeric(df[bar_exp], errors='coerce').sum()
+            total_act = pd.to_numeric(df[bar_act], errors='coerce').sum()
+            total_pie = pd.to_numeric(df[pie_val], errors='coerce').sum()
+            
+            # Build the starter data
+            default_summary = [
+                {"Metric Name": f"Total Expected ({bar_exp})", "Value": float(total_exp)},
+                {"Metric Name": f"Total Actual ({bar_act})", "Value": float(total_act)}
+            ]
+            if pie_val not in [bar_exp, bar_act]:
+                default_summary.append({"Metric Name": f"Total {pie_val}", "Value": float(total_pie)})
+            else:
+                default_summary.append({"Metric Name": "Combined Expected & Actual", "Value": float(total_exp + total_act)})
                 
-            with sum_cols[1]:
-                total_act = pd.to_numeric(df[bar_act], errors='coerce').sum()
-                st.metric(label=f"Total Actual ({bar_act})", value=f"₱{total_act:,.2f}")
-                
-            with sum_cols[2]:
-                if pie_val not in [bar_exp, bar_act]:
-                    total_pie = pd.to_numeric(df[pie_val], errors='coerce').sum()
-                    st.metric(label=f"Total {pie_val}", value=f"₱{total_pie:,.2f}")
-                else:
-                    st.metric(label="Combined Expected & Actual", value=f"₱{(total_exp + total_act):,.2f}")
+            summary_df = pd.DataFrame(default_summary)
+            
+            # Render the interactive data editor
+            edited_summary_df = st.data_editor(
+                summary_df,
+                num_rows="dynamic", # Allows adding/deleting rows
+                use_container_width=True,
+                column_config={
+                    "Metric Name": st.column_config.TextColumn("Metric Name", required=True),
+                    "Value": st.column_config.NumberColumn("Value (₱)", format="₱%.2f", required=True)
+                },
+                key="summary_editor"
+            )
             
             st.divider()
 
@@ -304,7 +313,8 @@ if menu == "Analytics Dashboard":
             else:
                 final_file_name = custom_file_name
             
-            pdf_bytes = generate_pdf_report(df, selected_sheet, bar_label, bar_exp, bar_act, pie_label, pie_val)
+            # UPDATED: Pass the custom edited_summary_df into the PDF generator
+            pdf_bytes = generate_pdf_report(df, selected_sheet, bar_label, bar_exp, bar_act, pie_label, pie_val, edited_summary_df)
             
             st.download_button(
                 label="Download Full Report as PDF",
