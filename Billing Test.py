@@ -26,7 +26,7 @@ def fix_arrow_types(df):
         df[col] = df[col].astype(str)
     return df
 
-def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie_label_col, pie_val_col, summary_df, show_currency):
+def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie_label_col, pie_val_col, summary_df):
     """Generates a PDF document with custom styled Bar and Pie charts matching the reference images."""
     pdf = FPDF()
     pdf.add_page()
@@ -41,15 +41,21 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
     pdf.cell(190, 10, "Summary Totals:", ln=True)
     pdf.set_font("Arial", '', 11)
     
-    # Conditionally set the currency prefix for the PDF
-    curr_prefix = "PHP " if show_currency else ""
-    
     # Loop through the custom dataframe to print the exact totals
     for index, row in summary_df.iterrows():
+        # Skip rows the user checked for deletion but hasn't fully removed yet
+        if row.get('Select for Deletion', False):
+            continue
+            
         m_name = str(row['Metric Name'])
         m_val = pd.to_numeric(row['Value'], errors='coerce')
         if pd.isna(m_val):
             m_val = 0.0
+            
+        # Check the individual row's currency toggle
+        show_curr = row.get("Show ₱", True)
+        curr_prefix = "PHP " if show_curr else ""
+        
         pdf.cell(190, 8, f"- {m_name}: {curr_prefix}{m_val:,.2f}", ln=True)
         
     pdf.ln(5)
@@ -58,13 +64,11 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
     if label_col in df.columns and expected_col in df.columns and actual_col in df.columns:
         fig, ax = plt.subplots(figsize=(10, 5))
         
-        # Group the data to combine identical x-axis labels
         df_bar = df.copy()
         df_bar[expected_col] = pd.to_numeric(df_bar[expected_col], errors='coerce').fillna(0)
         df_bar[actual_col] = pd.to_numeric(df_bar[actual_col], errors='coerce').fillna(0)
         grouped_bar = df_bar.groupby(label_col)[[expected_col, actual_col]].sum().reset_index()
         
-        # Extract lists from the grouped data
         labels = grouped_bar[label_col].astype(str).tolist()
         expected = grouped_bar[expected_col].tolist()
         actual = grouped_bar[actual_col].tolist()
@@ -72,27 +76,21 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
         x = np.arange(len(labels))
         width = 0.35  
         
-        # Plotting bars with specific colors matching the image
         bars1 = ax.bar(x - width/2, expected, width, label='EXPECTED', color='#4285F4', edgecolor='gray')
         bars2 = ax.bar(x + width/2, actual, width, label='ACTUAL', color='#EA4335', edgecolor='gray')
         
-        # Styling
         ax.set_title('EXPECTED VS ACTUAL', loc='left', fontsize=18, fontweight='bold', color='gray')
         ax.set_xticks(x)
         ax.set_xticklabels(labels)
         ax.legend(loc='upper left', frameon=False, ncol=2)
         
-        # Format Y-axis conditionally
-        if show_currency:
-            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, loc: f"₱{x:,.2f}"))
-        else:
-            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, loc: f"{x:,.2f}"))
+        # Format chart Y-axis
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda val, loc: f"₱{val:,.2f}"))
             
         ax.grid(axis='y', linestyle='-', alpha=0.7)
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
         
-        # Save and embed Bar Chart
         with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmpfile_bar:
             plt.savefig(tmpfile_bar.name, format='png', bbox_inches='tight', dpi=150)
             bar_path = tmpfile_bar.name
@@ -104,7 +102,6 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
 
     # --- CHART 2: BILLING PROGRESS (Pie Chart) ---
     if pie_label_col in df.columns and pie_val_col in df.columns:
-        # Group data for the pie chart
         pie_data = df.groupby(pie_label_col)[pie_val_col].sum().reset_index()
         
         fig, ax = plt.subplots(figsize=(8, 6))
@@ -213,36 +210,61 @@ if menu == "Analytics Dashboard":
             st.divider()
 
             # --- EDITABLE SUMMARY TOTALS (Sourced from DB) ---
-            st.markdown("### 📊 Summary Totals")
+            st.markdown("### 📊 Editable Summary Totals")
+            st.caption("These totals are calculated directly from your database. You can edit names, toggle the currency symbol per row, or delete/add rows. Edits here will not modify your main database.")
             
-            # Toggle for the currency symbol
-            show_currency = st.checkbox("Show Currency Symbol (₱)", value=True)
+            # --- Initialize or Load Session State for the Summary Table ---
+            # This ensures your custom edits and added rows survive when you click buttons
+            if "summary_data" not in st.session_state or st.session_state.get("summary_sheet") != selected_sheet:
+                st.session_state.summary_sheet = selected_sheet
+                db_totals = []
+                for col in numeric_cols:
+                    col_total = pd.to_numeric(df[col], errors='coerce').sum()
+                    db_totals.append({
+                        "Select for Deletion": False,
+                        "Show ₱": True,
+                        "Metric Name": f"Total {col}",
+                        "Value": float(col_total)
+                    })
+                st.session_state.summary_data = pd.DataFrame(db_totals)
             
-            st.caption("These totals are calculated directly from your database. You can edit the names or add custom rows. Edits are for the PDF report only and will not modify your database.")
-            
-            # --- NEW: Get all numeric columns from the Database and calculate totals ---
-            db_totals = []
-            for col in numeric_cols:
-                col_total = pd.to_numeric(df[col], errors='coerce').sum()
-                db_totals.append({"Metric Name": f"Total {col}", "Value": float(col_total)})
-                
-            summary_df = pd.DataFrame(db_totals)
-            
-            # Determine format string based on checkbox
-            val_format = "₱%.2f" if show_currency else "%.2f"
-            col_label = "Value (₱)" if show_currency else "Value"
-            
-            # Render the interactive data editor with the DB totals
+            # Render the interactive data editor
             edited_summary_df = st.data_editor(
-                summary_df,
+                st.session_state.summary_data,
                 num_rows="dynamic",
                 use_container_width=True,
                 column_config={
+                    "Select for Deletion": st.column_config.CheckboxColumn("🗑️ Delete?", default=False),
+                    "Show ₱": st.column_config.CheckboxColumn("Show ₱", default=True),
                     "Metric Name": st.column_config.TextColumn("Metric Name", required=True),
-                    "Value": st.column_config.NumberColumn(col_label, format=val_format, required=True)
+                    "Value": st.column_config.NumberColumn("Value", format="%.2f", required=True)
                 },
-                key="summary_editor"
+                key="summary_editor_widget"
             )
+            
+            # Save edits back to session state so they persist
+            st.session_state.summary_data = edited_summary_df
+
+            # --- Row Deletion Logic ---
+            col_del, col_reset = st.columns(2)
+            rows_to_delete_mask = edited_summary_df["Select for Deletion"] == True
+            num_to_delete = rows_to_delete_mask.sum()
+            
+            with col_del:
+                if st.button(f"🚨 Delete {num_to_delete} Selected Rows", disabled=num_to_delete == 0, use_container_width=True):
+                    # Filter out deleted rows and update session state
+                    st.session_state.summary_data = edited_summary_df[~rows_to_delete_mask].reset_index(drop=True)
+                    # Clear the widget's internal memory so it redraws properly
+                    if "summary_editor_widget" in st.session_state:
+                        del st.session_state["summary_editor_widget"]
+                    st.rerun()
+                    
+            with col_reset:
+                if st.button("🔄 Reset to Original DB Totals", use_container_width=True):
+                    st.session_state.summary_sheet = None # Forces a refresh on next run
+                    if "summary_editor_widget" in st.session_state:
+                        del st.session_state["summary_editor_widget"]
+                    st.rerun()
             
             st.divider()
 
@@ -270,10 +292,7 @@ if menu == "Analytics Dashboard":
             ax1.set_xticklabels(labels)
             ax1.legend(loc='upper left', frameon=False, ncol=2)
             
-            if show_currency:
-                ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda val, loc: f"₱{val:,.2f}"))
-            else:
-                ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda val, loc: f"{val:,.2f}"))
+            ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda val, loc: f"₱{val:,.2f}"))
                 
             ax1.grid(axis='y', linestyle='-', alpha=0.7)
             ax1.spines['top'].set_visible(False)
@@ -324,7 +343,7 @@ if menu == "Analytics Dashboard":
                 final_file_name = custom_file_name
             
             # This passes the final data table to the PDF builder
-            pdf_bytes = generate_pdf_report(df, selected_sheet, bar_label, bar_exp, bar_act, pie_label, pie_val, edited_summary_df, show_currency)
+            pdf_bytes = generate_pdf_report(df, selected_sheet, bar_label, bar_exp, bar_act, pie_label, pie_val, edited_summary_df)
             
             st.download_button(
                 label="Download Full Report as PDF",
