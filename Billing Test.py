@@ -13,7 +13,7 @@ import certifi
 @st.cache_resource
 def init_connection():
     return MongoClient(
-        st.secrets["MONGO_URI"],
+        "mongodb+srv://mykeltiu_db_user:Gu8suUJVihviPrjq@testing.kwm3vtx.mongodb.net/",
         tlsCAFile=certifi.where()
     )
 
@@ -56,7 +56,8 @@ def save_to_mongo(name, df):
     st.cache_data.clear()
     st.success(f"Billing Ledger '{name}' saved successfully!")
 
-def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie_label_col, pie_val_col, summary_df):
+# Replace the current generate_pdf_report signature with this:
+def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie_label_col, pie_val_col, pie_mode, summary_df):
     pdf = FPDF()
     pdf.add_page()
     
@@ -120,23 +121,35 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
         pdf.ln(5)
 
     # --- CHART 2: BILLING PROGRESS ---
-    if pie_label_col in df.columns and pie_val_col in df.columns:
+    can_plot_pie = False
+    
+    # Determine mode: Count vs Sum
+    if pie_mode == "Count of Items" and pie_label_col in df.columns:
+        pie_data = df.groupby(pie_label_col).size().reset_index(name='Count')
+        plot_val_col = 'Count'
+        can_plot_pie = True
+    elif pie_mode == "Sum of Values" and pie_label_col in df.columns and pie_val_col in df.columns:
         pie_data = df.groupby(pie_label_col)[pie_val_col].sum().reset_index()
+        plot_val_col = pie_val_col
+        can_plot_pie = True
+
+    if can_plot_pie:
         fig, ax = plt.subplots(figsize=(8, 6))
-        colors = ['#4285F4', '#34A853', '#FBBC05', '#EA4335']
-        total = pie_data[pie_val_col].sum()
+        # Adding a few more colors just in case there are many unique counts
+        colors = ['#4285F4', '#34A853', '#FBBC05', '#EA4335', '#9AA0A6', '#8A2BE2', '#FF7F50', '#00CED1']
+        total = pie_data[plot_val_col].sum()
         
         def absolute_value(val):
             a = np.round(val/100.*total, 0)
             return f"{int(a)} ({val:.1f}%)" if val > 5 else f"{val:.1f}%"
             
         ax.pie(
-            pie_data[pie_val_col], 
+            pie_data[plot_val_col], 
             labels=pie_data[pie_label_col], 
             autopct=absolute_value,
             shadow=False, 
             startangle=90,
-            colors=colors[:len(pie_data)],
+            colors=colors[:len(pie_data)] if len(pie_data) <= len(colors) else None,
             wedgeprops={'edgecolor': 'w', 'linewidth': 1}
         )
         
@@ -190,45 +203,78 @@ if menu == "Financial Analytics":
         else:
             
             # --- NEW FEATURE: AUTO-COMPUTE BALANCES MOVED HERE ---
-            st.markdown("### 🧮 Auto-Compute Tools")
-            st.caption("Select your expected and actual payment columns to automatically calculate 'Balance' and 'Status' for the dashboard and PDF report.")
+            # st.markdown("### 🧮 Auto-Compute Tools")
+            # st.caption("Select your expected and actual payment columns to automatically calculate 'Balance' and 'Status' for the dashboard and PDF report. You can customize the names of the metrics added to the Editable Financial Summary before calculating.")
             
-            ac1, ac2 = st.columns(2)
-            with ac1:
-                auto_exp_col = st.selectbox("Expected Amount Column", numeric_cols, index=0 if len(numeric_cols)>0 else None, key="auto_exp")
-            with ac2:
-                auto_act_col = st.selectbox("Actual Paid Column", numeric_cols, index=1 if len(numeric_cols)>1 else 0, key="auto_act")
+            # ac1, ac2 = st.columns(2)
+            # with ac1:
+            #     auto_exp_col = st.selectbox("Expected Amount Column", numeric_cols, index=0 if len(numeric_cols)>0 else None, key="auto_exp")
+            #     # NEW: Input for naming the Balance Metric
+            #     balance_metric_name = st.text_input("Name for Balance Metric", value="Total Balance", key="auto_bal_name")
+            # with ac2:
+            #     auto_act_col = st.selectbox("Actual Paid Column", numeric_cols, index=1 if len(numeric_cols)>1 else 0, key="auto_act")
+            #     # NEW: Input for naming the Status Metrics
+            #     status_metric_format = st.text_input("Name Format for Status (use {status})", value="Total {status} Invoices", key="auto_stat_name")
                 
-            if st.button("⚡ Auto-Calculate Balance & Status"):
-                if auto_exp_col and auto_act_col:
-                    try:
-                        updated_master_df = df.copy()
-                        exp = pd.to_numeric(updated_master_df[auto_exp_col], errors='coerce').fillna(0)
-                        act = pd.to_numeric(updated_master_df[auto_act_col], errors='coerce').fillna(0)
+            # if st.button("⚡ Auto-Calculate Balance & Status"):
+            #     if auto_exp_col and auto_act_col:
+            #         try:
+            #             updated_master_df = df.copy()
+            #             exp = pd.to_numeric(updated_master_df[auto_exp_col], errors='coerce').fillna(0)
+            #             act = pd.to_numeric(updated_master_df[auto_act_col], errors='coerce').fillna(0)
                         
-                        updated_master_df["Balance"] = exp - act
+            #             updated_master_df["Balance"] = exp - act
                         
-                        conditions = [
-                            (act == 0) & (exp > 0),
-                            (act > 0) & (act < exp),
-                            (act >= exp) & (exp > 0),
-                            (act > exp)
-                        ]
-                        choices = ["Unpaid", "Partially Paid", "Fully Paid", "Overpaid"]
+            #             conditions = [
+            #                 (act == 0) & (exp > 0),
+            #                 (act > 0) & (act < exp),
+            #                 (act >= exp) & (exp > 0),
+            #                 (act > exp)
+            #             ]
+            #             choices = ["Unpaid", "Partially Paid", "Fully Paid", "Overpaid"]
                         
-                        if "Status" not in updated_master_df.columns:
-                            updated_master_df["Status"] = "Pending"
+            #             if "Status" not in updated_master_df.columns:
+            #                 updated_master_df["Status"] = "Pending"
                             
-                        updated_master_df["Status"] = np.select(conditions, choices, default=updated_master_df["Status"])
+            #             updated_master_df["Status"] = np.select(conditions, choices, default=updated_master_df["Status"])
                         
-                        save_to_mongo(selected_sheet, updated_master_df)
-                        # Force the summary widget to regenerate and pick up the new totals
-                        st.session_state.summary_sheet = None 
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error computing values: {e}")
+            #             save_to_mongo(selected_sheet, updated_master_df)
+                        
+            #             # --- NEW: Append calculated rows to the Financial Summary ---
+            #             if "summary_data" in st.session_state:
+            #                 new_rows = []
+                            
+            #                 # 1. Add the custom named 'Balance' to the summary (if it doesn't already exist)
+            #                 if not (st.session_state.summary_data["Metric Name"] == balance_metric_name).any():
+            #                     new_rows.append({
+            #                         "Select for Deletion": False,
+            #                         "Show ₱": True,
+            #                         "Metric Name": balance_metric_name,
+            #                         "Value": float(updated_master_df["Balance"].sum())
+            #                     })
+                                
+            #                 # 2. Add count of invoices for each 'Status' using the custom format
+            #                 status_counts = updated_master_df["Status"].value_counts()
+            #                 for status, count in status_counts.items():
+            #                     metric_name = status_metric_format.replace("{status}", str(status))
+            #                     if not (st.session_state.summary_data["Metric Name"] == metric_name).any():
+            #                         new_rows.append({
+            #                             "Select for Deletion": False,
+            #                             "Show ₱": False, # Turn off currency symbol for counts
+            #                             "Metric Name": metric_name,
+            #                             "Value": float(count)
+            #                         })
+                            
+            #                 # Append the new rows safely using pd.concat
+            #                 if new_rows:
+            #                     new_df = pd.DataFrame(new_rows)
+            #                     st.session_state.summary_data = pd.concat([st.session_state.summary_data, new_df], ignore_index=True)
+
+            #             st.rerun()
+            #         except Exception as e:
+            #             st.error(f"Error computing values: {e}")
             
-            st.divider()
+            # st.divider()
 
             st.markdown("### ⚙️ Chart Data Mapping")
             c1, c2 = st.columns(2)
@@ -241,8 +287,15 @@ if menu == "Financial Analytics":
                 
             with c2:
                 st.markdown("**Collection Status Breakdown**")
+                # Add a radio button to toggle modes
+                pie_mode = st.radio("Pie Chart Mode", ["Sum of Values", "Count of Items"], horizontal=True, key="pie_mode_radio")
                 pie_label = st.selectbox("Status Categories (e.g., Status)", cat_cols, index=0 if len(cat_cols) > 0 else None, key="pie_label_select")
-                pie_val = st.selectbox("Values (e.g., Expected_Amount or Balance)", numeric_cols, index=0 if len(numeric_cols) > 0 else None, key="pie_val_select")
+                
+                # Only show the value selector if we are calculating sums
+                if pie_mode == "Sum of Values":
+                    pie_val = st.selectbox("Values (e.g., Expected_Amount or Balance)", numeric_cols, index=0 if len(numeric_cols) > 0 else None, key="pie_val_select")
+                else:
+                    pie_val = "Count"
 
             st.divider()
 
@@ -319,21 +372,29 @@ if menu == "Financial Analytics":
             # --- CHART 2: BILLING PROGRESS ---
             st.markdown("### COLLECTION STATUS BREAKDOWN")
             fig2, ax2 = plt.subplots(figsize=(8, 6))
-            pie_data = df.groupby(pie_label)[pie_val].sum().reset_index()
-            colors = ['#4285F4', '#34A853', '#FBBC05', '#EA4335', '#9AA0A6']
             
-            total = pie_data[pie_val].sum()
+            # Switch between count vs sum grouping
+            if pie_mode == "Sum of Values":
+                pie_data = df.groupby(pie_label)[pie_val].sum().reset_index()
+                plot_val_col = pie_val
+            else:
+                pie_data = df.groupby(pie_label).size().reset_index(name='Count')
+                plot_val_col = 'Count'
+
+            colors = ['#4285F4', '#34A853', '#FBBC05', '#EA4335', '#9AA0A6', '#8A2BE2', '#FF7F50', '#00CED1']
+            total = pie_data[plot_val_col].sum()
+            
             def absolute_value(val):
                 a = np.round(val/100.*total, 0)
                 return f"{int(a)} ({val:.1f}%)" if val > 5 else f"{val:.1f}%"
                 
             ax2.pie(
-                pie_data[pie_val], 
+                pie_data[plot_val_col], 
                 labels=pie_data[pie_label], 
                 autopct=absolute_value,
                 shadow=False, 
                 startangle=90,
-                colors=colors[:len(pie_data)],
+                colors=colors[:len(pie_data)] if len(pie_data) <= len(colors) else None,
                 wedgeprops={'edgecolor': 'w', 'linewidth': 1}
             )
             ax2.axis('equal')
@@ -344,7 +405,9 @@ if menu == "Financial Analytics":
             st.markdown("### 📥 Export Dashboard")
             custom_file_name = st.text_input("Save file as:", value=f"{selected_sheet}_billing_report", key="pdf_filename_input")
             final_file_name = custom_file_name if custom_file_name.lower().endswith(".pdf") else f"{custom_file_name}.pdf"
-            pdf_bytes = generate_pdf_report(df, selected_sheet, bar_label, bar_exp, bar_act, pie_label, pie_val, edited_summary_df)
+            
+            # Add 'pie_mode' to this line:
+            pdf_bytes = generate_pdf_report(df, selected_sheet, bar_label, bar_exp, bar_act, pie_label, pie_val, pie_mode, edited_summary_df)
             
             st.download_button(
                 label="Download Financial Report (PDF)",
