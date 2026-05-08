@@ -13,7 +13,7 @@ import certifi
 @st.cache_resource
 def init_connection():
     return MongoClient(
-        "mongodb+srv://mykeltiu_db_user:Gu8suUJVihviPrjq@testing.kwm3vtx.mongodb.net/",
+        st.secrets["MONGO_URI"],
         tlsCAFile=certifi.where()
     )
 
