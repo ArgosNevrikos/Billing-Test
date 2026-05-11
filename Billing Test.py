@@ -27,6 +27,40 @@ st.title("💼 Billing & Invoice Monitoring System")
 st.markdown("Track invoices, manage payments, automate balances, and monitor your billing cycles efficiently.")
 
 # --- FUNCTIONS ---
+def auto_project_dates(df, date_cols_sequence, days_to_add=14):
+    """
+    Cascades date projections horizontally row-by-row.
+    If multiple steps are missing, it calculates Step 3 based on the projected Step 2.
+    """
+    df_proj = df.copy()
+    
+    for i in range(len(date_cols_sequence) - 1):
+        col_current = date_cols_sequence[i]
+        col_next = date_cols_sequence[i+1]
+        
+        # Skip if columns don't exist in the current sheet
+        if col_current not in df_proj.columns or col_next not in df_proj.columns:
+            continue
+            
+        # CRITICAL FIX: Temporarily clean the current column by removing " (Proj)" 
+        # This allows the script to do math on dates it just projected in the previous loop!
+        clean_current_col = df_proj[col_current].astype(str).str.replace(" (Proj)", "", regex=False)
+        current_dates = pd.to_datetime(clean_current_col, errors='coerce')
+        
+        # Identify rows in the next column that need a projection ('-', 'to update', blanks)
+        needs_update = df_proj[col_next].isna() | df_proj[col_next].astype(str).str.strip().str.lower().isin(['', '-', 'nan', 'none', 'to update'])
+        
+        # Add the projection days
+        projected_dates = current_dates + pd.Timedelta(days=days_to_add)
+        
+        # Create a mask where we HAVE a valid current date AND the next date is missing
+        mask = needs_update & current_dates.notna()
+        
+        # Apply the projected date and append the "(Proj)" tag
+        df_proj.loc[mask, col_next] = projected_dates[mask].dt.strftime('%m/%d/%Y') + " (Proj)"
+        
+    return df_proj
+
 def fix_arrow_types(df):
     cols = df.select_dtypes(include=['object', 'string']).columns
     if not cols.empty:
@@ -87,38 +121,52 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
     pdf.ln(5)
     
     # --- CHART 1: EXPECTED VS ACTUAL ---
-    if label_col in df.columns and expected_col in df.columns and actual_col in df.columns:
+    if label_col in df.columns and (expected_col != "None" or actual_col != "None"):
         fig, ax = plt.subplots(figsize=(10, 5))
         
-        grouped_bar = df.groupby(label_col)[[expected_col, actual_col]].sum(numeric_only=True).reset_index()
+        # Group only unique columns
+        cols_to_group = []
+        if expected_col != "None" and expected_col in df.columns: cols_to_group.append(expected_col)
+        if actual_col != "None" and actual_col in df.columns and actual_col != expected_col: cols_to_group.append(actual_col)
         
-        labels = grouped_bar[label_col].astype(str).tolist()
-        expected = grouped_bar[expected_col].tolist()
-        actual = grouped_bar[actual_col].tolist()
-        
-        x = np.arange(len(labels))
-        width = 0.35  
-        
-        ax.bar(x - width/2, expected, width, label='EXPECTED REVENUE', color='#4285F4', edgecolor='gray')
-        ax.bar(x + width/2, actual, width, label='ACTUAL PAYMENTS', color='#34A853', edgecolor='gray')
-        
-        ax.set_title('EXPECTED REVENUE VS. ACTUAL PAYMENTS', loc='left', fontsize=16, fontweight='bold', color='gray')
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels)
-        ax.legend(loc='upper left', frameon=False, ncol=2)
-        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda val, loc: f"₱{val:,.2f}"))
-        ax.grid(axis='y', linestyle='-', alpha=0.7)
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmpfile_bar:
-            plt.savefig(tmpfile_bar.name, format='png', bbox_inches='tight', dpi=150)
-            bar_path = tmpfile_bar.name
-        plt.close(fig) 
-        
-        pdf.image(bar_path, x=10, w=190)
-        os.remove(bar_path)
-        pdf.ln(5)
+        if cols_to_group:
+            grouped_bar = df.groupby(label_col)[cols_to_group].sum(numeric_only=True).reset_index()
+            
+            labels = grouped_bar[label_col].astype(str).tolist()
+            x = np.arange(len(labels))
+            
+            if expected_col != "None" and actual_col != "None":
+                expected = grouped_bar[expected_col].tolist()
+                actual = expected if expected_col == actual_col else grouped_bar[actual_col].tolist()
+                width = 0.35  
+                ax.bar(x - width/2, expected, width, label='EXPECTED REVENUE', color='#4285F4', edgecolor='gray')
+                ax.bar(x + width/2, actual, width, label='ACTUAL PAYMENTS', color='#34A853', edgecolor='gray')
+            elif expected_col != "None":
+                expected = grouped_bar[expected_col].tolist()
+                width = 0.5
+                ax.bar(x, expected, width, label='EXPECTED REVENUE', color='#4285F4', edgecolor='gray')
+            elif actual_col != "None":
+                actual = grouped_bar[actual_col].tolist()
+                width = 0.5
+                ax.bar(x, actual, width, label='ACTUAL PAYMENTS', color='#34A853', edgecolor='gray')
+            
+            ax.set_title('EXPECTED REVENUE VS. ACTUAL PAYMENTS', loc='left', fontsize=16, fontweight='bold', color='gray')
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels)
+            ax.legend(loc='upper left', frameon=False, ncol=2)
+            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda val, loc: f"₱{val:,.2f}"))
+            ax.grid(axis='y', linestyle='-', alpha=0.7)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmpfile_bar:
+                plt.savefig(tmpfile_bar.name, format='png', bbox_inches='tight', dpi=150)
+                bar_path = tmpfile_bar.name
+            plt.close(fig) 
+            
+            pdf.image(bar_path, x=10, w=190)
+            os.remove(bar_path)
+            pdf.ln(5)
 
     # --- CHART 2: BILLING PROGRESS ---
     can_plot_pie = False
@@ -201,90 +249,18 @@ if menu == "Financial Analytics":
         if not numeric_cols:
             st.warning("This sheet doesn't contain numeric billing data for charting.")
         else:
-            
-            # --- NEW FEATURE: AUTO-COMPUTE BALANCES MOVED HERE ---
-            # st.markdown("### 🧮 Auto-Compute Tools")
-            # st.caption("Select your expected and actual payment columns to automatically calculate 'Balance' and 'Status' for the dashboard and PDF report. You can customize the names of the metrics added to the Editable Financial Summary before calculating.")
-            
-            # ac1, ac2 = st.columns(2)
-            # with ac1:
-            #     auto_exp_col = st.selectbox("Expected Amount Column", numeric_cols, index=0 if len(numeric_cols)>0 else None, key="auto_exp")
-            #     # NEW: Input for naming the Balance Metric
-            #     balance_metric_name = st.text_input("Name for Balance Metric", value="Total Balance", key="auto_bal_name")
-            # with ac2:
-            #     auto_act_col = st.selectbox("Actual Paid Column", numeric_cols, index=1 if len(numeric_cols)>1 else 0, key="auto_act")
-            #     # NEW: Input for naming the Status Metrics
-            #     status_metric_format = st.text_input("Name Format for Status (use {status})", value="Total {status} Invoices", key="auto_stat_name")
-                
-            # if st.button("⚡ Auto-Calculate Balance & Status"):
-            #     if auto_exp_col and auto_act_col:
-            #         try:
-            #             updated_master_df = df.copy()
-            #             exp = pd.to_numeric(updated_master_df[auto_exp_col], errors='coerce').fillna(0)
-            #             act = pd.to_numeric(updated_master_df[auto_act_col], errors='coerce').fillna(0)
-                        
-            #             updated_master_df["Balance"] = exp - act
-                        
-            #             conditions = [
-            #                 (act == 0) & (exp > 0),
-            #                 (act > 0) & (act < exp),
-            #                 (act >= exp) & (exp > 0),
-            #                 (act > exp)
-            #             ]
-            #             choices = ["Unpaid", "Partially Paid", "Fully Paid", "Overpaid"]
-                        
-            #             if "Status" not in updated_master_df.columns:
-            #                 updated_master_df["Status"] = "Pending"
-                            
-            #             updated_master_df["Status"] = np.select(conditions, choices, default=updated_master_df["Status"])
-                        
-            #             save_to_mongo(selected_sheet, updated_master_df)
-                        
-            #             # --- NEW: Append calculated rows to the Financial Summary ---
-            #             if "summary_data" in st.session_state:
-            #                 new_rows = []
-                            
-            #                 # 1. Add the custom named 'Balance' to the summary (if it doesn't already exist)
-            #                 if not (st.session_state.summary_data["Metric Name"] == balance_metric_name).any():
-            #                     new_rows.append({
-            #                         "Select for Deletion": False,
-            #                         "Show ₱": True,
-            #                         "Metric Name": balance_metric_name,
-            #                         "Value": float(updated_master_df["Balance"].sum())
-            #                     })
-                                
-            #                 # 2. Add count of invoices for each 'Status' using the custom format
-            #                 status_counts = updated_master_df["Status"].value_counts()
-            #                 for status, count in status_counts.items():
-            #                     metric_name = status_metric_format.replace("{status}", str(status))
-            #                     if not (st.session_state.summary_data["Metric Name"] == metric_name).any():
-            #                         new_rows.append({
-            #                             "Select for Deletion": False,
-            #                             "Show ₱": False, # Turn off currency symbol for counts
-            #                             "Metric Name": metric_name,
-            #                             "Value": float(count)
-            #                         })
-                            
-            #                 # Append the new rows safely using pd.concat
-            #                 if new_rows:
-            #                     new_df = pd.DataFrame(new_rows)
-            #                     st.session_state.summary_data = pd.concat([st.session_state.summary_data, new_df], ignore_index=True)
-
-            #             st.rerun()
-            #         except Exception as e:
-            #             st.error(f"Error computing values: {e}")
-            
-            # st.divider()
-
             st.markdown("### ⚙️ Chart Data Mapping")
             c1, c2 = st.columns(2)
             
             with c1:
                 st.markdown("**Expected Revenue vs Actual Payments**")
                 bar_label = st.selectbox("X-Axis (e.g., Months, Clients)", df.columns, index=0, key="bar_label_select")
-                bar_exp = st.selectbox("Expected Values (e.g., Expected_Amount)", numeric_cols, index=0 if len(numeric_cols) > 0 else None, key="bar_exp_select")
-                bar_act = st.selectbox("Actual Values (e.g., Actual_Paid)", numeric_cols, index=1 if len(numeric_cols) > 1 else 0, key="bar_act_select")
                 
+                # Add "None" to the options list to allow a blank choice
+                exp_act_options = ["None"] + numeric_cols
+                
+                bar_exp = st.selectbox("Expected Values (e.g., Expected_Amount)", exp_act_options, index=1 if len(numeric_cols) > 0 else 0, key="bar_exp_select")
+                bar_act = st.selectbox("Actual Values (e.g., Actual_Paid)", exp_act_options, index=2 if len(numeric_cols) > 1 else (1 if len(numeric_cols) > 0 else 0), key="bar_act_select")
             with c2:
                 st.markdown("**Collection Status Breakdown**")
                 # Add a radio button to toggle modes
@@ -349,24 +325,47 @@ if menu == "Financial Analytics":
 
             # --- CHART 1: EXPECTED VS ACTUAL ---
             st.markdown("### EXPECTED REVENUE VS ACTUAL PAYMENTS")
-            fig1, ax1 = plt.subplots(figsize=(10, 5))
-            grouped_bar = df.groupby(bar_label)[[bar_exp, bar_act]].sum(numeric_only=True).reset_index()
-            labels = grouped_bar[bar_label].astype(str).tolist()
-            expected = grouped_bar[bar_exp].tolist()
-            actual = grouped_bar[bar_act].tolist()
-            x = np.arange(len(labels))
-            width = 0.35  
             
-            ax1.bar(x - width/2, expected, width, label='EXPECTED REVENUE', color='#4285F4', edgecolor='gray')
-            ax1.bar(x + width/2, actual, width, label='ACTUAL PAYMENTS', color='#34A853', edgecolor='gray')
-            ax1.set_xticks(x)
-            ax1.set_xticklabels(labels)
-            ax1.legend(loc='upper left', frameon=False, ncol=2)
-            ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda val, loc: f"₱{val:,.2f}"))
-            ax1.grid(axis='y', linestyle='-', alpha=0.7)
-            ax1.spines['top'].set_visible(False)
-            ax1.spines['right'].set_visible(False)
-            st.pyplot(fig1)
+            if bar_exp == "None" and bar_act == "None":
+                st.info("ℹ️ Please select at least one numeric column for Expected or Actual values to view this chart.")
+            else:
+                fig1, ax1 = plt.subplots(figsize=(10, 5))
+                
+                # Group only unique columns to prevent the duplicate column DataFrame bug
+                cols_to_group = []
+                if bar_exp != "None": cols_to_group.append(bar_exp)
+                if bar_act != "None" and bar_act != bar_exp: cols_to_group.append(bar_act)
+                
+                grouped_bar = df.groupby(bar_label)[cols_to_group].sum(numeric_only=True).reset_index()
+                labels = grouped_bar[bar_label].astype(str).tolist()
+                x = np.arange(len(labels))
+                
+                if bar_exp != "None" and bar_act != "None":
+                    expected = grouped_bar[bar_exp].tolist()
+                    actual = expected if bar_exp == bar_act else grouped_bar[bar_act].tolist()
+                    
+                    width = 0.35  
+                    ax1.bar(x - width/2, expected, width, label='EXPECTED REVENUE', color='#4285F4', edgecolor='gray')
+                    ax1.bar(x + width/2, actual, width, label='ACTUAL PAYMENTS', color='#34A853', edgecolor='gray')
+                    ax1.set_xticks(x)
+                elif bar_exp != "None":
+                    expected = grouped_bar[bar_exp].tolist()
+                    width = 0.5
+                    ax1.bar(x, expected, width, label='EXPECTED REVENUE', color='#4285F4', edgecolor='gray')
+                    ax1.set_xticks(x)
+                elif bar_act != "None":
+                    actual = grouped_bar[bar_act].tolist()
+                    width = 0.5
+                    ax1.bar(x, actual, width, label='ACTUAL PAYMENTS', color='#34A853', edgecolor='gray')
+                    ax1.set_xticks(x)
+                    
+                ax1.set_xticklabels(labels)
+                ax1.legend(loc='upper left', frameon=False, ncol=2)
+                ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda val, loc: f"₱{val:,.2f}"))
+                ax1.grid(axis='y', linestyle='-', alpha=0.7)
+                ax1.spines['top'].set_visible(False)
+                ax1.spines['right'].set_visible(False)
+                st.pyplot(fig1)
             st.divider()
 
             # --- CHART 2: BILLING PROGRESS ---
@@ -434,7 +433,25 @@ elif menu == "Add New Billing Ledger":
         uploaded_file = st.file_uploader("Upload your billing records to start", type=["xlsx", "csv"])
         
         if uploaded_file:
-            df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith('xlsx') else pd.read_csv(uploaded_file)
+            # Check if the file is an Excel file
+            if uploaded_file.name.endswith('xlsx'):
+                # Load the Excel file to get sheet names
+                xls = pd.ExcelFile(uploaded_file)
+                sheet_names = xls.sheet_names
+                
+                # Let the user select a tab if there are multiple
+                if len(sheet_names) > 1:
+                    selected_tab = st.selectbox("📂 Select the Excel tab (sheet) to load:", sheet_names)
+                else:
+                    selected_tab = sheet_names[0]
+                    st.info(f"Loaded the only sheet available: {selected_tab}")
+                    
+                # Read the selected sheet
+                df = pd.read_excel(uploaded_file, sheet_name=selected_tab)
+            else:
+                # Handle CSV files normally
+                df = pd.read_csv(uploaded_file)
+                
             df = fix_arrow_types(df)
 
             st.write(f"Preview (Showing all {len(df)} records):")
@@ -589,6 +606,43 @@ elif menu == "Manage Billing Records":
 
         st.divider()
         
+        with st.expander("📅 Auto-Project Missing Dates"):
+            st.markdown("Select your chronological date columns. The system will fill in blanks or 'to update' cells based on the previous step's date.")
+            
+            # Your exact chronological map
+            target_sequence = [
+                "P&D", 
+                "FOR (GR) PROCESSING", 
+                "GR", 
+                "BILL TO JB CENTER", 
+                "PAYMENT ADVICE", 
+                "COLLECTION RECEIPT"
+            ]
+            
+            # Safety check: Only pre-select columns that actually exist in the current sheet
+            valid_defaults = [col for col in target_sequence if col in df.columns]
+            
+            # The multiselect will now default to your specific workflow
+            date_sequence = st.multiselect(
+                "Select Date Columns in Chronological Order:",
+                options=df.columns.tolist(),
+                default=valid_defaults,
+                help="The standard billing sequence. You can add or remove steps if needed."
+            )
+            
+            days_to_project = st.number_input("Days to add for projection:", min_value=1, value=14, step=1)
+            
+            if st.button("🚀 Apply Projections", type="primary"):
+                if len(date_sequence) < 2:
+                    st.warning("Please select at least two columns to create a projection sequence.")
+                else:
+                    updated_df = auto_project_dates(df, date_sequence, days_to_project)
+                    save_to_mongo(selected_sheet, updated_df)
+                    st.success("Projections applied successfully!")
+                    st.rerun()
+
+        st.divider()
+
         col1, col2 = st.columns(2)
         with col1:
             if st.button("💾 Save Ledger Changes", type="primary", width="stretch"):
