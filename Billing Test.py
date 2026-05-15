@@ -28,37 +28,43 @@ st.markdown("Track invoices, manage payments, automate balances, and monitor you
 
 # --- FUNCTIONS ---
 def auto_project_dates(df, date_cols_sequence, days_to_add=14):
-    """
-    Cascades date projections horizontally row-by-row.
-    If multiple steps are missing, it calculates Step 3 based on the projected Step 2.
-    """
     df_proj = df.copy()
-    
+    blank_indicators = ['', '-', '–', '—', 'nan', 'none', 'null', 'nat', 'to update']
+
+    # CASCADE PROJECTION
     for i in range(len(date_cols_sequence) - 1):
         col_current = date_cols_sequence[i]
         col_next = date_cols_sequence[i+1]
         
-        # Skip if columns don't exist in the current sheet
         if col_current not in df_proj.columns or col_next not in df_proj.columns:
             continue
             
-        # CRITICAL FIX: Temporarily clean the current column by removing " (Proj)" 
-        # This allows the script to do math on dates it just projected in the previous loop!
-        clean_current_col = df_proj[col_current].astype(str).str.replace(" (Proj)", "", regex=False)
-        current_dates = pd.to_datetime(clean_current_col, errors='coerce')
+        # THE ULTIMATE FIX: Regex Extraction
+        extracted_dates = df_proj[col_current].astype(str).str.extract(r'(\d{4}-\d{2}-\d{2})')[0]
         
-        # Identify rows in the next column that need a projection ('-', 'to update', blanks)
-        needs_update = df_proj[col_next].isna() | df_proj[col_next].astype(str).str.strip().str.lower().isin(['', '-', 'nan', 'none', 'to update'])
+        # Convert extracted text to dates so we can do math
+        current_dates = pd.to_datetime(extracted_dates, errors='coerce')
         
-        # Add the projection days
+        # Identify blank/missing cells in the NEXT column
+        next_col_str = df_proj[col_next].astype(str).str.strip().str.lower()
+        needs_update = df_proj[col_next].isna() | next_col_str.isin(blank_indicators)
+        
+        # Add the target days
         projected_dates = current_dates + pd.Timedelta(days=days_to_add)
         
-        # Create a mask where we HAVE a valid current date AND the next date is missing
+        # Mask where we have a date to project FROM, and a blank cell to project TO
         mask = needs_update & current_dates.notna()
         
-        # Apply the projected date and append the "(Proj)" tag
-        df_proj.loc[mask, col_next] = projected_dates[mask].dt.strftime('%m/%d/%Y') + " (Proj)"
-        
+        # Apply the projection
+        df_proj.loc[mask, col_next] = projected_dates[mask].dt.strftime('%Y-%m-%d') + " (Projected)"
+
+    # FINAL CLEANUP: Erase any lingering 00:00:00 on untouched older dates
+    for col in date_cols_sequence:
+        if col in df_proj.columns:
+            clean_strings = df_proj[col].astype(str).str.replace(" 00:00:00", "", regex=False)
+            clean_strings = clean_strings.replace({'nan': '', 'NaT': '', 'None': '', 'nat': ''})
+            df_proj[col] = clean_strings
+            
     return df_proj
 
 def fix_arrow_types(df):
@@ -67,11 +73,11 @@ def fix_arrow_types(df):
         df[cols] = df[cols].astype(str)
     return df
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=5)
 def load_sheet_names():
     return [doc["sheet_name"] for doc in collection.find({}, {"sheet_name": 1})]
 
-@st.cache_data(show_spinner="Loading data from database...")
+@st.cache_data(show_spinner="Loading data from database...", ttl=5)
 def get_sheet_data(name):
     doc = collection.find_one({"sheet_name": name})
     if not doc:
@@ -90,15 +96,16 @@ def save_to_mongo(name, df):
     st.cache_data.clear()
     st.success(f"Billing Ledger '{name}' saved successfully!")
 
-# Replace the current generate_pdf_report signature with this:
-def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie_label_col, pie_val_col, pie_mode, summary_df):
+# Updated signature to include title visibility and chart visibility options
+def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie_label_col, pie_val_col, pie_mode, summary_df, chart1_title, chart2_title, custom_exp_label, custom_act_label, main_pdf_title, show_main_title, show_chart1, show_chart2):
     pdf = FPDF()
     pdf.add_page()
     
     # --- REPORT HEADER ---
-    pdf.set_font("Arial", 'B', 16)
-    pdf.cell(190, 10, f"Billing Analytics Report: {sheet_name}", ln=True, align='C')
-    pdf.ln(5)
+    if show_main_title:
+        pdf.set_font("Arial", 'B', 16)
+        pdf.cell(190, 10, main_pdf_title, ln=True, align='C')
+        pdf.ln(5)
     
     # --- EDITABLE SUMMARY METRICS ---
     pdf.set_font("Arial", 'B', 12)
@@ -121,10 +128,9 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
     pdf.ln(5)
     
     # --- CHART 1: EXPECTED VS ACTUAL ---
-    if label_col in df.columns and (expected_col != "None" or actual_col != "None"):
+    if show_chart1 and label_col in df.columns and (expected_col != "None" or actual_col != "None"):
         fig, ax = plt.subplots(figsize=(10, 5))
         
-        # Group only unique columns
         cols_to_group = []
         if expected_col != "None" and expected_col in df.columns: cols_to_group.append(expected_col)
         if actual_col != "None" and actual_col in df.columns and actual_col != expected_col: cols_to_group.append(actual_col)
@@ -139,20 +145,20 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
                 expected = grouped_bar[expected_col].tolist()
                 actual = expected if expected_col == actual_col else grouped_bar[actual_col].tolist()
                 width = 0.35  
-                ax.bar(x - width/2, expected, width, label='EXPECTED REVENUE', color='#4285F4', edgecolor='gray')
-                ax.bar(x + width/2, actual, width, label='ACTUAL PAYMENTS', color='#34A853', edgecolor='gray')
+                ax.bar(x - width/2, expected, width, label=custom_exp_label, color='#4285F4', edgecolor='gray')
+                ax.bar(x + width/2, actual, width, label=custom_act_label, color='#34A853', edgecolor='gray')
             elif expected_col != "None":
                 expected = grouped_bar[expected_col].tolist()
                 width = 0.5
-                ax.bar(x, expected, width, label='EXPECTED REVENUE', color='#4285F4', edgecolor='gray')
+                ax.bar(x, expected, width, label=custom_exp_label, color='#4285F4', edgecolor='gray')
             elif actual_col != "None":
                 actual = grouped_bar[actual_col].tolist()
                 width = 0.5
-                ax.bar(x, actual, width, label='ACTUAL PAYMENTS', color='#34A853', edgecolor='gray')
+                ax.bar(x, actual, width, label=custom_act_label, color='#34A853', edgecolor='gray')
             
-            ax.set_title('EXPECTED REVENUE VS. ACTUAL PAYMENTS', loc='left', fontsize=16, fontweight='bold', color='gray')
+            ax.set_title(chart1_title, loc='left', fontsize=16, fontweight='bold', color='gray')
             ax.set_xticks(x)
-            ax.set_xticklabels(labels)
+            ax.set_xticklabels(labels, rotation=45, ha='right')
             ax.legend(loc='upper left', frameon=False, ncol=2)
             ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda val, loc: f"₱{val:,.2f}"))
             ax.grid(axis='y', linestyle='-', alpha=0.7)
@@ -169,49 +175,47 @@ def generate_pdf_report(df, sheet_name, label_col, expected_col, actual_col, pie
             pdf.ln(5)
 
     # --- CHART 2: BILLING PROGRESS ---
-    can_plot_pie = False
-    
-    # Determine mode: Count vs Sum
-    if pie_mode == "Count of Items" and pie_label_col in df.columns:
-        pie_data = df.groupby(pie_label_col).size().reset_index(name='Count')
-        plot_val_col = 'Count'
-        can_plot_pie = True
-    elif pie_mode == "Sum of Values" and pie_label_col in df.columns and pie_val_col in df.columns:
-        pie_data = df.groupby(pie_label_col)[pie_val_col].sum().reset_index()
-        plot_val_col = pie_val_col
-        can_plot_pie = True
+    if show_chart2:
+        can_plot_pie = False
+        if pie_mode == "Count of Items" and pie_label_col in df.columns:
+            pie_data = df.groupby(pie_label_col).size().reset_index(name='Count')
+            plot_val_col = 'Count'
+            can_plot_pie = True
+        elif pie_mode == "Sum of Values" and pie_label_col in df.columns and pie_val_col in df.columns:
+            pie_data = df.groupby(pie_label_col)[pie_val_col].sum().reset_index()
+            plot_val_col = pie_val_col
+            can_plot_pie = True
 
-    if can_plot_pie:
-        fig, ax = plt.subplots(figsize=(8, 6))
-        # Adding a few more colors just in case there are many unique counts
-        colors = ['#4285F4', '#34A853', '#FBBC05', '#EA4335', '#9AA0A6', '#8A2BE2', '#FF7F50', '#00CED1']
-        total = pie_data[plot_val_col].sum()
-        
-        def absolute_value(val):
-            a = np.round(val/100.*total, 0)
-            return f"{int(a)} ({val:.1f}%)" if val > 5 else f"{val:.1f}%"
+        if can_plot_pie:
+            fig, ax = plt.subplots(figsize=(8, 6))
+            colors = ['#4285F4', '#34A853', '#FBBC05', '#EA4335', '#9AA0A6', '#8A2BE2', '#FF7F50', '#00CED1']
+            total = pie_data[plot_val_col].sum()
             
-        ax.pie(
-            pie_data[plot_val_col], 
-            labels=pie_data[pie_label_col], 
-            autopct=absolute_value,
-            shadow=False, 
-            startangle=90,
-            colors=colors[:len(pie_data)] if len(pie_data) <= len(colors) else None,
-            wedgeprops={'edgecolor': 'w', 'linewidth': 1}
-        )
-        
-        ax.set_title('COLLECTION STATUS PROGRESS\n', loc='left', fontsize=16, fontweight='bold', color='gray')
-        ax.axis('equal') 
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmpfile_pie:
-            plt.savefig(tmpfile_pie.name, format='png', bbox_inches='tight', dpi=150)
-            pie_path = tmpfile_pie.name
-        plt.close(fig)
-        
-        pdf.ln(85) 
-        pdf.image(pie_path, x=25, w=160)
-        os.remove(pie_path)
+            def absolute_value(val):
+                a = np.round(val/100.*total, 0)
+                return f"{int(a)} ({val:.1f}%)" if val > 5 else f"{val:.1f}%"
+                
+            ax.pie(
+                pie_data[plot_val_col], 
+                labels=pie_data[pie_label_col], 
+                autopct=absolute_value,
+                shadow=False, 
+                startangle=90,
+                colors=colors[:len(pie_data)] if len(pie_data) <= len(colors) else None,
+                wedgeprops={'edgecolor': 'w', 'linewidth': 1}
+            )
+            
+            ax.set_title(f"{chart2_title}\n", loc='left', fontsize=16, fontweight='bold', color='gray')
+            ax.axis('equal') 
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmpfile_pie:
+                plt.savefig(tmpfile_pie.name, format='png', bbox_inches='tight', dpi=150)
+                pie_path = tmpfile_pie.name
+            plt.close(fig)
+            
+            pdf.ln(85) 
+            pdf.image(pie_path, x=25, w=160)
+            os.remove(pie_path)
 
     return pdf.output(dest='S').encode('latin-1')
 
@@ -222,6 +226,11 @@ menu = st.sidebar.radio("Navigation", [
     "Financial Analytics", 
     "System Settings"
 ])
+
+st.sidebar.divider()
+if st.sidebar.button("🔄 Sync / Refresh Data", type="primary", use_container_width=True):
+    st.cache_data.clear() 
+    st.rerun()            
 
 if menu == "Financial Analytics":
     st.header("📈 Financial & Collection Dashboard")
@@ -256,18 +265,15 @@ if menu == "Financial Analytics":
                 st.markdown("**Expected Revenue vs Actual Payments**")
                 bar_label = st.selectbox("X-Axis (e.g., Months, Clients)", df.columns, index=0, key="bar_label_select")
                 
-                # Add "None" to the options list to allow a blank choice
                 exp_act_options = ["None"] + numeric_cols
                 
                 bar_exp = st.selectbox("Expected Values (e.g., Expected_Amount)", exp_act_options, index=1 if len(numeric_cols) > 0 else 0, key="bar_exp_select")
                 bar_act = st.selectbox("Actual Values (e.g., Actual_Paid)", exp_act_options, index=2 if len(numeric_cols) > 1 else (1 if len(numeric_cols) > 0 else 0), key="bar_act_select")
             with c2:
                 st.markdown("**Collection Status Breakdown**")
-                # Add a radio button to toggle modes
                 pie_mode = st.radio("Pie Chart Mode", ["Sum of Values", "Count of Items"], horizontal=True, key="pie_mode_radio")
                 pie_label = st.selectbox("Status Categories (e.g., Status)", cat_cols, index=0 if len(cat_cols) > 0 else None, key="pie_label_select")
                 
-                # Only show the value selector if we are calculating sums
                 if pie_mode == "Sum of Values":
                     pie_val = st.selectbox("Values (e.g., Expected_Amount or Balance)", numeric_cols, index=0 if len(numeric_cols) > 0 else None, key="pie_val_select")
                 else:
@@ -324,14 +330,21 @@ if menu == "Financial Analytics":
             st.divider()
 
             # --- CHART 1: EXPECTED VS ACTUAL ---
-            st.markdown("### EXPECTED REVENUE VS ACTUAL PAYMENTS")
+            c_title1, c_leg1, c_leg2 = st.columns([2, 1, 1])
+            with c_title1:
+                chart1_title = st.text_input("Chart 1 Title", value="EXPECTED REVENUE VS ACTUAL PAYMENTS")
+            with c_leg1:
+                custom_exp_label = st.text_input("Rename 'Expected' Legend", value="EXPECTED REVENUE")
+            with c_leg2:
+                custom_act_label = st.text_input("Rename 'Actual' Legend", value="ACTUAL PAYMENTS")
+
+            st.markdown(f"### {chart1_title}")
             
             if bar_exp == "None" and bar_act == "None":
                 st.info("ℹ️ Please select at least one numeric column for Expected or Actual values to view this chart.")
             else:
                 fig1, ax1 = plt.subplots(figsize=(10, 5))
                 
-                # Group only unique columns to prevent the duplicate column DataFrame bug
                 cols_to_group = []
                 if bar_exp != "None": cols_to_group.append(bar_exp)
                 if bar_act != "None" and bar_act != bar_exp: cols_to_group.append(bar_act)
@@ -345,21 +358,21 @@ if menu == "Financial Analytics":
                     actual = expected if bar_exp == bar_act else grouped_bar[bar_act].tolist()
                     
                     width = 0.35  
-                    ax1.bar(x - width/2, expected, width, label='EXPECTED REVENUE', color='#4285F4', edgecolor='gray')
-                    ax1.bar(x + width/2, actual, width, label='ACTUAL PAYMENTS', color='#34A853', edgecolor='gray')
+                    ax1.bar(x - width/2, expected, width, label=custom_exp_label, color='#4285F4', edgecolor='gray')
+                    ax1.bar(x + width/2, actual, width, label=custom_act_label, color='#34A853', edgecolor='gray')
                     ax1.set_xticks(x)
                 elif bar_exp != "None":
                     expected = grouped_bar[bar_exp].tolist()
                     width = 0.5
-                    ax1.bar(x, expected, width, label='EXPECTED REVENUE', color='#4285F4', edgecolor='gray')
+                    ax1.bar(x, expected, width, label=custom_exp_label, color='#4285F4', edgecolor='gray')
                     ax1.set_xticks(x)
                 elif bar_act != "None":
                     actual = grouped_bar[bar_act].tolist()
                     width = 0.5
-                    ax1.bar(x, actual, width, label='ACTUAL PAYMENTS', color='#34A853', edgecolor='gray')
+                    ax1.bar(x, actual, width, label=custom_act_label, color='#34A853', edgecolor='gray')
                     ax1.set_xticks(x)
                     
-                ax1.set_xticklabels(labels)
+                ax1.set_xticklabels(labels, rotation=45, ha='right')
                 ax1.legend(loc='upper left', frameon=False, ncol=2)
                 ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda val, loc: f"₱{val:,.2f}"))
                 ax1.grid(axis='y', linestyle='-', alpha=0.7)
@@ -369,10 +382,11 @@ if menu == "Financial Analytics":
             st.divider()
 
             # --- CHART 2: BILLING PROGRESS ---
-            st.markdown("### COLLECTION STATUS BREAKDOWN")
+            chart2_title = st.text_input("Chart 2 Title", value="COLLECTION STATUS BREAKDOWN")
+            st.markdown(f"### {chart2_title}")
+            
             fig2, ax2 = plt.subplots(figsize=(8, 6))
             
-            # Switch between count vs sum grouping
             if pie_mode == "Sum of Values":
                 pie_data = df.groupby(pie_label)[pie_val].sum().reset_index()
                 plot_val_col = pie_val
@@ -402,11 +416,28 @@ if menu == "Financial Analytics":
             # --- EXPORT TO PDF ---
             st.divider()
             st.markdown("### 📥 Export Dashboard")
-            custom_file_name = st.text_input("Save file as:", value=f"{selected_sheet}_billing_report", key="pdf_filename_input")
+            
+            # --- NEW PDF EXPORT OPTIONS ---
+            exp_col1, exp_col2 = st.columns(2)
+            with exp_col1:
+                custom_file_name = st.text_input("Save file as:", value=f"{selected_sheet}_billing_report", key="pdf_filename_input")
+                main_pdf_title = st.text_input("Main PDF Title", value=f"Billing Analytics Report: {selected_sheet}")
+            with exp_col2:
+                st.markdown("**PDF Output Options:**")
+                show_main_title = st.checkbox("Include Main Title", value=True)
+                show_chart1_pdf = st.checkbox(f"Include Chart 1 ({chart1_title})", value=True)
+                show_chart2_pdf = st.checkbox(f"Include Chart 2 ({chart2_title})", value=True)
+            
             final_file_name = custom_file_name if custom_file_name.lower().endswith(".pdf") else f"{custom_file_name}.pdf"
             
-            # Add 'pie_mode' to this line:
-            pdf_bytes = generate_pdf_report(df, selected_sheet, bar_label, bar_exp, bar_act, pie_label, pie_val, pie_mode, edited_summary_df)
+            pdf_bytes = generate_pdf_report(
+                df, selected_sheet, 
+                bar_label, bar_exp, bar_act, 
+                pie_label, pie_val, pie_mode, edited_summary_df,
+                chart1_title, chart2_title, custom_exp_label, custom_act_label,
+                main_pdf_title, show_main_title, show_chart1_pdf, show_chart2_pdf
+            )
+            # ------------------------------
             
             st.download_button(
                 label="Download Financial Report (PDF)",
@@ -433,23 +464,18 @@ elif menu == "Add New Billing Ledger":
         uploaded_file = st.file_uploader("Upload your billing records to start", type=["xlsx", "csv"])
         
         if uploaded_file:
-            # Check if the file is an Excel file
             if uploaded_file.name.endswith('xlsx'):
-                # Load the Excel file to get sheet names
                 xls = pd.ExcelFile(uploaded_file)
                 sheet_names = xls.sheet_names
                 
-                # Let the user select a tab if there are multiple
                 if len(sheet_names) > 1:
                     selected_tab = st.selectbox("📂 Select the Excel tab (sheet) to load:", sheet_names)
                 else:
                     selected_tab = sheet_names[0]
                     st.info(f"Loaded the only sheet available: {selected_tab}")
                     
-                # Read the selected sheet
                 df = pd.read_excel(uploaded_file, sheet_name=selected_tab)
             else:
-                # Handle CSV files normally
                 df = pd.read_csv(uploaded_file)
                 
             df = fix_arrow_types(df)
@@ -466,7 +492,6 @@ elif menu == "Add New Billing Ledger":
     elif creation_method == "Create Standard Billing Template":
         st.info("A standard billing template has been loaded for you. Fill in the records below!")
         
-        # New standardized billing template
         starter_data = pd.DataFrame([{
             "Invoice_ID": "INV-001", 
             "Client_Name": "", 
@@ -500,6 +525,12 @@ elif menu == "Manage Billing Records":
         selected_sheet = st.selectbox("Select Ledger to Edit/View", sheets)
         df = get_sheet_data(selected_sheet)
         
+        if "working_sheet" not in st.session_state or st.session_state.working_sheet != selected_sheet:
+            st.session_state.working_sheet = selected_sheet
+            st.session_state.working_df = get_sheet_data(selected_sheet)
+            
+        df = st.session_state.working_df
+
         st.subheader("🔍 Search & Filter")
         f_col1, f_col2 = st.columns(2)
         
@@ -523,7 +554,6 @@ elif menu == "Manage Billing Records":
                 with n3:
                     num_val = st.number_input("Value:", value=0.0)
 
-        # Vectorized Filtering Application
         filtered_df = df.copy()
         
         if search_term:
@@ -609,7 +639,6 @@ elif menu == "Manage Billing Records":
         with st.expander("📅 Auto-Project Missing Dates"):
             st.markdown("Select your chronological date columns. The system will fill in blanks or 'to update' cells based on the previous step's date.")
             
-            # Your exact chronological map
             target_sequence = [
                 "P&D", 
                 "FOR (GR) PROCESSING", 
@@ -619,10 +648,8 @@ elif menu == "Manage Billing Records":
                 "COLLECTION RECEIPT"
             ]
             
-            # Safety check: Only pre-select columns that actually exist in the current sheet
             valid_defaults = [col for col in target_sequence if col in df.columns]
             
-            # The multiselect will now default to your specific workflow
             date_sequence = st.multiselect(
                 "Select Date Columns in Chronological Order:",
                 options=df.columns.tolist(),
@@ -636,9 +663,10 @@ elif menu == "Manage Billing Records":
                 if len(date_sequence) < 2:
                     st.warning("Please select at least two columns to create a projection sequence.")
                 else:
-                    updated_df = auto_project_dates(df, date_sequence, days_to_project)
-                    save_to_mongo(selected_sheet, updated_df)
-                    st.success("Projections applied successfully!")
+                    clean_edited = edited_filtered_df.drop(columns=["Select for Deletion"], errors='ignore')
+                    updated_df = auto_project_dates(clean_edited, date_sequence, days_to_project)
+                    st.session_state.working_df.update(updated_df)
+                    st.success("✅ Projections applied to the table above! Click 'Save Ledger Changes' below to finalize.")
                     st.rerun()
 
         st.divider()
@@ -646,13 +674,13 @@ elif menu == "Manage Billing Records":
         col1, col2 = st.columns(2)
         with col1:
             if st.button("💾 Save Ledger Changes", type="primary", width="stretch"):
-                updated_master_df = df.copy()
+                updated_master_df = st.session_state.working_df.copy()
                 clean_edited_df = edited_filtered_df.drop(columns=["Select for Deletion"])
                 clean_filtered_df = filtered_df.drop(columns=["Select for Deletion"])
                 
                 updated_master_df.update(clean_edited_df)
                 
-                new_rows = clean_edited_df[~clean_edited_df.index.isin(df.index)]
+                new_rows = clean_edited_df[~clean_edited_df.index.isin(updated_master_df.index)]
                 if not new_rows.empty:
                     updated_master_df = pd.concat([updated_master_df, new_rows], ignore_index=True)
                     
@@ -660,6 +688,7 @@ elif menu == "Manage Billing Records":
                 updated_master_df = updated_master_df.drop(deleted_indices)
                 
                 save_to_mongo(selected_sheet, updated_master_df)
+                st.session_state.working_df = updated_master_df
                 st.rerun()
                 
         with col2:
